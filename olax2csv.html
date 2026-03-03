@@ -1,0 +1,603 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>OpenLab .OLAX → CSV (single-file)</title>
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 18px; }
+    h1 { font-size: 18px; margin: 0 0 10px; }
+    .row { display: flex; gap: 12px; flex-wrap: wrap; align-items: center; }
+    .card { border: 1px solid #ddd; border-radius: 10px; padding: 12px; margin: 12px 0; }
+    button { padding: 8px 12px; border-radius: 8px; border: 1px solid #ccc; background: #f7f7f7; cursor: pointer; }
+    button:disabled { opacity: 0.6; cursor: not-allowed; }
+    input[type="file"] { padding: 6px; }
+    table { width: 100%; border-collapse: collapse; }
+    th, td { border-bottom: 1px solid #eee; padding: 8px 6px; vertical-align: top; }
+    th { text-align: left; font-weight: 600; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; }
+    .log { white-space: pre-wrap; background: #0b1020; color: #d7e2ff; padding: 10px; border-radius: 10px; }
+    .pill { display: inline-block; padding: 2px 8px; border-radius: 999px; border: 1px solid #ddd; font-size: 12px; }
+    .ok { border-color: #b6e3c8; background: #f1fff7; }
+    .warn { border-color: #ffe3a3; background: #fff9ea; }
+  </style>
+</head>
+<body>
+  <h1>OpenLab CDS .OLAX → CSV (single HTML)</h1>
+
+  <div class="card">
+    <div class="row">
+      <input id="file" type="file" accept=".olax" />
+      <button id="parseBtn" disabled>Parse</button>
+      <button id="zipBtn" disabled>Download selected as ZIP</button>
+      <span id="status" class="pill warn">No file loaded</span>
+    </div>
+    <div style="margin-top:10px" class="mono">
+      Exports CSV columns: <b>time_ms, time_s, time_min, value</b><br/>
+      Finds traces from <b>injection.acmd</b> and matching <b>TraceId.CH</b>.
+    </div>
+  </div>
+
+  <div class="card">
+    <div id="results">
+      <div class="mono">Load an .olax file to see traces (UIB, VWD, etc.).</div>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="mono" style="margin-bottom:8px;">Log</div>
+    <div id="log" class="log mono"></div>
+  </div>
+
+<script>
+/* ============================
+   Minimal ZIP reader (store + deflate) using DecompressionStream
+   ============================ */
+
+function u32(dv, off) { return dv.getUint32(off, true); }
+function u16(dv, off) { return dv.getUint16(off, true); }
+
+function logln(...args) {
+  const el = document.getElementById('log');
+  el.textContent += args.join(' ') + "\n";
+  el.scrollTop = el.scrollHeight;
+}
+
+async function inflateBytes(u8, type) {
+  if (typeof DecompressionStream === "undefined") {
+    throw new Error("DecompressionStream is not available in this browser.");
+  }
+  const ds = new DecompressionStream(type);
+  const stream = new Blob([u8]).stream().pipeThrough(ds);
+  const ab = await new Response(stream).arrayBuffer();
+  return new Uint8Array(ab);
+}
+
+async function inflateRawOrDeflate(u8) {
+  // ZIP uses raw DEFLATE. Most modern browsers support "deflate-raw".
+  const types = ["deflate-raw", "deflate"];
+  let lastErr = null;
+  for (const t of types) {
+    try { return await inflateBytes(u8, t); }
+    catch (e) { lastErr = e; }
+  }
+  throw new Error("Failed to decompress deflate stream. " + (lastErr?.message || ""));
+}
+
+function findEOCD(u8) {
+  // End of central directory signature: 0x06054b50
+  const sig = 0x06054b50;
+  const maxBack = Math.min(u8.length - 22, 0x10000 + 22); // search last 64k
+  const dv = new DataView(u8.buffer, u8.byteOffset, u8.byteLength);
+  for (let i = u8.length - 22; i >= u8.length - maxBack; i--) {
+    if (u32(dv, i) === sig) return i;
+  }
+  return -1;
+}
+
+function decodeUTF8(u8) {
+  return new TextDecoder("utf-8", {fatal:false}).decode(u8);
+}
+
+function encodeUTF8(s) {
+  return new TextEncoder().encode(s);
+}
+
+function parseZip(u8) {
+  const dv = new DataView(u8.buffer, u8.byteOffset, u8.byteLength);
+  const eocdOff = findEOCD(u8);
+  if (eocdOff < 0) throw new Error("Not a ZIP (EOCD not found).");
+  const cdSize = u32(dv, eocdOff + 12);
+  const cdOff  = u32(dv, eocdOff + 16);
+  const entries = u16(dv, eocdOff + 10);
+
+  const files = new Map();
+  let p = cdOff;
+  for (let i = 0; i < entries; i++) {
+    if (u32(dv, p) !== 0x02014b50) throw new Error("Central directory entry signature mismatch.");
+    const gpFlags = u16(dv, p + 8);
+    const method = u16(dv, p + 10);
+    const crc = u32(dv, p + 16);
+    const cSize = u32(dv, p + 20);
+    const uSize = u32(dv, p + 24);
+    const nameLen = u16(dv, p + 28);
+    const extraLen = u16(dv, p + 30);
+    const commentLen = u16(dv, p + 32);
+    const lho = u32(dv, p + 42);
+    const nameBytes = u8.slice(p + 46, p + 46 + nameLen);
+    const name = decodeUTF8(nameBytes);
+
+    files.set(name, { name, gpFlags, method, crc, cSize, uSize, lho });
+    p = p + 46 + nameLen + extraLen + commentLen;
+  }
+  return { files, dv, u8 };
+}
+
+function getFileSlice(zip, entry) {
+  const dv = zip.dv;
+  const u8 = zip.u8;
+  const p = entry.lho;
+  if (u32(dv, p) !== 0x04034b50) throw new Error("Local header signature mismatch for " + entry.name);
+  const nameLen = u16(dv, p + 26);
+  const extraLen = u16(dv, p + 28);
+  const dataStart = p + 30 + nameLen + extraLen;
+  const comp = u8.slice(dataStart, dataStart + entry.cSize);
+  return comp;
+}
+
+async function readZipFile(zip, name) {
+  const entry = zip.files.get(name);
+  if (!entry) throw new Error("Missing file in zip: " + name);
+  const comp = getFileSlice(zip, entry);
+  if (entry.method === 0) return comp;             // store
+  if (entry.method === 8) return await inflateRawOrDeflate(comp); // deflate
+  throw new Error("Unsupported ZIP compression method " + entry.method + " for " + name);
+}
+
+/* ============================
+   OpenLab parsing + CSV export
+   ============================ */
+
+function xmlParse(text) {
+  const doc = new DOMParser().parseFromString(text, "application/xml");
+  const pe = doc.querySelector("parsererror");
+  if (pe) throw new Error("XML parse error.");
+  return doc;
+}
+
+function getTextNS(el, ns, tag) {
+  const n = el.getElementsByTagNameNS(ns, tag)[0];
+  return n ? (n.textContent || "").trim() : "";
+}
+
+function sanitizeName(s) {
+  return (s || "trace").replace(/[^A-Za-z0-9._-]+/g, "_");
+}
+
+function bestFloatSegment(u8, n, slope, expMin, expMax) {
+  // Try float64 segments at 8-byte aligned offsets.
+  const minTol = Math.max(50, 0.05 * Math.abs(expMin || 0));
+  const maxTol = Math.max(10, 0.02 * Math.abs(expMax || 0));
+  let best = null;
+
+  const buf = u8.buffer;
+  const base = u8.byteOffset;
+  const limit = u8.byteLength - n * 8;
+  for (let off = 0; off <= limit; off += 8) {
+    let arr;
+    try {
+      arr = new Float64Array(buf, base + off, n);
+    } catch (_) { continue; }
+
+    let mn = Infinity, mx = -Infinity, maxAbs = 0, zeros = 0, lead = 0;
+    let seenNonZero = false;
+
+    for (let i = 0; i < n; i++) {
+      const v = arr[i];
+      if (!Number.isFinite(v)) { mn = NaN; break; }
+      if (v === 0) zeros++;
+      if (!seenNonZero) { if (v !== 0) { seenNonZero = true; } else { lead++; } }
+      if (v < mn) mn = v;
+      if (v > mx) mx = v;
+      const av = Math.abs(v);
+      if (av > maxAbs) maxAbs = av;
+    }
+    if (!Number.isFinite(mn) || maxAbs > 1e12) continue;
+
+    const smn = mn * slope;
+    const smx = mx * slope;
+
+    if (Math.abs(smx - expMax) > maxTol) continue;
+    if (Math.abs(smn - expMin) > minTol) continue;
+
+    const score = Math.abs(smn - expMin) + Math.abs(smx - expMax) + 0.01 * zeros + 0.001 * lead;
+    if (!best || score < best.score) best = { score, off, arr };
+  }
+  return best; // {off, arr}
+}
+
+function findAllZeroSegment(u8, n) {
+  const buf = u8.buffer;
+  const base = u8.byteOffset;
+  const limit = u8.byteLength - n * 8;
+  for (let off = 0; off <= limit; off += 8) {
+    let arr;
+    try { arr = new Float64Array(buf, base + off, n); } catch (_) { continue; }
+    let ok = true;
+    for (let i = 0; i < n; i++) { if (arr[i] !== 0) { ok = false; break; } }
+    if (ok) return { off, arr };
+  }
+  return null;
+}
+
+function makeCSV(trace, y) {
+  const n = y.length;
+  const t0 = trace.timeStart;
+  const t1 = trace.timeEnd;
+  const dt = n ? (t1 - t0) / n : 0;
+
+  const header = `time_ms,time_s,time_min,${trace.valueHeader}\n`;
+  const lines = new Array(n);
+  for (let i = 0; i < n; i++) {
+    const tms = t0 + i * dt;
+    const ts  = tms / 1000;
+    const tm  = tms / 60000;
+    // keep enough precision without being huge
+    lines[i] = `${tms.toFixed(6)},${ts.toFixed(6)},${tm.toFixed(8)},${y[i]}\n`;
+  }
+  return header + lines.join("");
+}
+
+function downloadBlob(blob, filename) {
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  setTimeout(() => {
+    URL.revokeObjectURL(a.href);
+    a.remove();
+  }, 0);
+}
+
+/* ============================
+   Minimal ZIP writer (STORE only) for "download all as ZIP"
+   ============================ */
+
+function crc32Table() {
+  const table = new Uint32Array(256);
+  for (let i = 0; i < 256; i++) {
+    let c = i;
+    for (let k = 0; k < 8; k++) c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1);
+    table[i] = c >>> 0;
+  }
+  return table;
+}
+const CRC_TABLE = crc32Table();
+
+function crc32(u8) {
+  let c = 0xFFFFFFFF;
+  for (let i = 0; i < u8.length; i++) c = CRC_TABLE[(c ^ u8[i]) & 0xFF] ^ (c >>> 8);
+  return (c ^ 0xFFFFFFFF) >>> 0;
+}
+
+function le16(n) { return [n & 255, (n >>> 8) & 255]; }
+function le32(n) { return [n & 255, (n >>> 8) & 255, (n >>> 16) & 255, (n >>> 24) & 255]; }
+
+function zipStore(files) {
+  // files: [{name, dataUint8}]
+  const parts = [];
+  const central = [];
+  let offset = 0;
+
+  for (const f of files) {
+    const nameBytes = encodeUTF8(f.name);
+    const data = f.data;
+    const c = crc32(data);
+
+    // Local file header
+    const lfh = [
+      ...le32(0x04034b50), ...le16(20), ...le16(0), ...le16(0),
+      ...le16(0), ...le16(0),
+      ...le32(c), ...le32(data.length), ...le32(data.length),
+      ...le16(nameBytes.length), ...le16(0)
+    ];
+    parts.push(new Uint8Array(lfh), nameBytes, data);
+
+    // Central directory header
+    const cdh = [
+      ...le32(0x02014b50), ...le16(20), ...le16(20), ...le16(0), ...le16(0),
+      ...le16(0), ...le16(0),
+      ...le32(c), ...le32(data.length), ...le32(data.length),
+      ...le16(nameBytes.length), ...le16(0), ...le16(0),
+      ...le16(0), ...le16(0),
+      ...le32(0), ...le32(offset)
+    ];
+    central.push(new Uint8Array(cdh), nameBytes);
+
+    offset += lfh.length + nameBytes.length + data.length;
+  }
+
+  const cdStart = offset;
+  for (const c of central) { parts.push(c); offset += c.length; }
+  const cdSize = offset - cdStart;
+
+  // EOCD
+  const eocd = [
+    ...le32(0x06054b50),
+    ...le16(0), ...le16(0),
+    ...le16(files.length), ...le16(files.length),
+    ...le32(cdSize), ...le32(cdStart),
+    ...le16(0)
+  ];
+  parts.push(new Uint8Array(eocd));
+
+  return new Blob(parts, { type: "application/zip" });
+}
+
+/* ============================
+   App
+   ============================ */
+
+let current = {
+  olaxName: "",
+  traces: [],        // [{...meta..., selected, csvName, csvText}]
+  olaxZip: null,
+  dxZip: null
+};
+
+function setStatus(text, kind="warn") {
+  const s = document.getElementById("status");
+  s.textContent = text;
+  s.className = "pill " + (kind === "ok" ? "ok" : "warn");
+}
+
+function renderTraces() {
+  const root = document.getElementById("results");
+  if (!current.traces.length) {
+    root.innerHTML = `<div class="mono">No traces found.</div>`;
+    return;
+  }
+
+  const rows = current.traces.map((t, i) => {
+    const desc = (t.description || "").slice(0, 120);
+    const enc = (t.encoding || "").split("/").pop();
+    return `
+      <tr>
+        <td><input type="checkbox" data-i="${i}" ${t.selected ? "checked" : ""}></td>
+        <td class="mono">${t.device || ""}</td>
+        <td class="mono">${t.channel || ""}</td>
+        <td class="mono">${t.units || ""}</td>
+        <td class="mono">${t.n}</td>
+        <td class="mono">${enc}</td>
+        <td class="mono">${(t.timeStart/1000).toFixed(3)}–${(t.timeEnd/1000).toFixed(3)} s</td>
+        <td class="mono">${desc}</td>
+        <td>
+          <button data-dl="${i}">Download CSV</button>
+        </td>
+      </tr>
+    `;
+  }).join("");
+
+  root.innerHTML = `
+    <div class="mono" style="margin-bottom:8px;">
+      Found <b>${current.traces.length}</b> trace(s). UIB is usually device <b>UIB</b>, channels <b>UIB1A</b>/<b>UIB1B</b>.
+    </div>
+    <table>
+      <thead>
+        <tr>
+          <th>Select</th><th>Device</th><th>Channel</th><th>Units</th><th>N</th><th>Encoding</th><th>Time</th><th>Description</th><th></th>
+        </tr>
+      </thead>
+      <tbody>${rows}</tbody>
+    </table>
+  `;
+
+  root.querySelectorAll('input[type="checkbox"]').forEach(cb => {
+    cb.addEventListener("change", (e) => {
+      const i = Number(e.target.getAttribute("data-i"));
+      current.traces[i].selected = e.target.checked;
+      updateZipButton();
+    });
+  });
+
+  root.querySelectorAll('button[data-dl]').forEach(btn => {
+    btn.addEventListener("click", () => downloadOne(Number(btn.getAttribute("data-dl"))));
+  });
+}
+
+function updateZipButton() {
+  const any = current.traces.some(t => t.selected);
+  document.getElementById("zipBtn").disabled = !any;
+}
+
+async function downloadOne(i) {
+  try {
+    const t = current.traces[i];
+    if (!t.csvText) await buildCSVForTrace(t);
+    downloadBlob(new Blob([t.csvText], {type:"text/csv"}), t.csvName);
+  } catch (e) {
+    alert("Download failed: " + e.message);
+  }
+}
+
+async function buildCSVForTrace(t) {
+  // load CH bytes
+  const chName = `${t.traceId}.CH`;
+  const chBytes = await readZipFile(current.dxZip, chName);
+
+  let seg = null;
+  if (Math.abs(t.min - t.max) < 1e-12 && Math.abs(t.max) < 1e-12) {
+    seg = findAllZeroSegment(chBytes, t.n);
+    if (!seg) seg = { off: 0, arr: new Float64Array(chBytes.buffer, chBytes.byteOffset, t.n) };
+  } else {
+    seg = bestFloatSegment(chBytes, t.n, t.slope, t.min, t.max);
+    if (!seg) {
+      // fallback: first float64 block
+      seg = { off: 0, arr: new Float64Array(chBytes.buffer, chBytes.byteOffset, t.n) };
+    }
+  }
+
+  const y = new Array(t.n);
+  for (let i = 0; i < t.n; i++) y[i] = seg.arr[i] * t.slope;
+
+  t.csvText = makeCSV(t, y);
+  t.csvName = t.csvName || `${sanitizeName(t.device)}_${sanitizeName(t.channel)}.csv`;
+  t.extractedOffset = seg.off;
+}
+
+async function downloadSelectedZip() {
+  try {
+    const selected = current.traces.filter(t => t.selected);
+    if (!selected.length) return;
+
+    setStatus("Building CSV…", "warn");
+    logln("Building CSV for", selected.length, "trace(s)…");
+
+    const out = [];
+    for (const t of selected) {
+      if (!t.csvText) await buildCSVForTrace(t);
+      out.push({ name: t.csvName, data: encodeUTF8(t.csvText) });
+    }
+
+    const zipBlob = zipStore(out);
+    const zipName = sanitizeName(current.olaxName || "export") + "_csv.zip";
+    downloadBlob(zipBlob, zipName);
+
+    setStatus("Done", "ok");
+    logln("ZIP ready:", zipName);
+  } catch (e) {
+    setStatus("Error", "warn");
+    alert("ZIP export failed: " + e.message);
+  }
+}
+
+async function parseOlax(arrayBuffer, fileName) {
+  current = { olaxName: fileName, traces: [], olaxZip: null, dxZip: null };
+  document.getElementById("results").innerHTML = `<div class="mono">Parsing…</div>`;
+  document.getElementById("zipBtn").disabled = true;
+
+  const olaxBytes = new Uint8Array(arrayBuffer);
+  const olaxZip = parseZip(olaxBytes);
+  current.olaxZip = olaxZip;
+
+  // Find first *.dx inside olax
+  const dxNames = [...olaxZip.files.keys()].filter(n => n.toLowerCase().endsWith(".dx"));
+  if (!dxNames.length) throw new Error("No .dx found inside .olax.");
+  const dxName = dxNames[0];
+
+  logln("OLAX contains .dx:", dxName);
+
+  const dxBytes = await readZipFile(olaxZip, dxName);
+  const dxZip = parseZip(dxBytes);
+  current.dxZip = dxZip;
+
+  // Find injection.acmd
+  const acmdName = [...dxZip.files.keys()].find(n => n.toLowerCase().endsWith("injection.acmd"));
+  if (!acmdName) throw new Error("No injection.acmd found inside .dx.");
+  const acmdBytes = await readZipFile(dxZip, acmdName);
+  const acmdText = new TextDecoder("utf-8", {fatal:false}).decode(acmdBytes);
+  const doc = xmlParse(acmdText);
+
+  const ns = "urn:schemas-agilent-com:acmd20";
+  const signals = Array.from(doc.getElementsByTagNameNS(ns, "Signal"));
+  logln("Signals in injection.acmd:", signals.length);
+
+  const traces = [];
+  for (const s of signals) {
+    const traceId = getTextNS(s, ns, "TraceId");
+    if (!traceId) continue;
+
+    const chName = `${traceId}.CH`;
+    if (!dxZip.files.has(chName)) continue;
+
+    const n = Number(getTextNS(s, ns, "NumberOfValues") || "0");
+    if (!Number.isFinite(n) || n <= 0) continue;
+
+    const encoding = getTextNS(s, ns, "Encoding");
+    const device = getTextNS(s, ns, "DeviceName");
+    const channel = getTextNS(s, ns, "ChannelName");
+    const description = getTextNS(s, ns, "Description");
+    const units = getTextNS(s, ns, "Units");
+    const timeStart = Number(getTextNS(s, ns, "TimeStart") || "0");
+    const timeEnd   = Number(getTextNS(s, ns, "TimeEnd") || "0");
+    const min = Number(getTextNS(s, ns, "Minimum") || "0");
+    const max = Number(getTextNS(s, ns, "Maximum") || "0");
+    const slope = Number(getTextNS(s, ns, "Slope") || "1");
+
+    const wl = (description.match(/Wavelength\s*=\s*([0-9.]+)\s*nm/i) || [])[1] || "";
+    const csvName = `${sanitizeName(device)}_${sanitizeName(channel)}${wl ? "_" + wl + "nm" : ""}.csv`;
+
+    traces.push({
+      selected: true,
+      traceId, chName,
+      device, channel, description, units, encoding,
+      timeStart, timeEnd, min, max, slope, n,
+      valueHeader: (channel || "value") + (units ? "_" + units : ""),
+      csvName,
+      csvText: null,
+      extractedOffset: null
+    });
+  }
+
+  // Prefer Signal179 (chromatogram-like), but still show everything we can export.
+  traces.sort((a,b) => {
+    const a179 = (a.encoding || "").endsWith("Signal179") ? 0 : 1;
+    const b179 = (b.encoding || "").endsWith("Signal179") ? 0 : 1;
+    if (a179 !== b179) return a179 - b179;
+    return (a.device || "").localeCompare(b.device || "") || (a.channel || "").localeCompare(b.channel || "");
+  });
+
+  current.traces = traces;
+  renderTraces();
+  updateZipButton();
+
+  setStatus(`Parsed: ${traces.length} trace(s)`, traces.length ? "ok" : "warn");
+  logln("Traces ready:", traces.length);
+}
+
+/* ============================
+   Wire UI
+   ============================ */
+
+const fileEl = document.getElementById("file");
+const parseBtn = document.getElementById("parseBtn");
+const zipBtn = document.getElementById("zipBtn");
+
+fileEl.addEventListener("change", () => {
+  parseBtn.disabled = !fileEl.files?.length;
+  setStatus(fileEl.files?.length ? "File ready" : "No file loaded", fileEl.files?.length ? "ok" : "warn");
+});
+
+parseBtn.addEventListener("click", async () => {
+  try {
+    document.getElementById("log").textContent = "";
+    const f = fileEl.files[0];
+    if (!f) return;
+
+    setStatus("Parsing…", "warn");
+    logln("Loading:", f.name, "(" + f.size + " bytes)");
+    const ab = await f.arrayBuffer();
+    await parseOlax(ab, f.name);
+
+    // quick hint: show if UIB exists
+    const hasUIB = current.traces.some(t => (t.device || "").toUpperCase() === "UIB");
+    logln(hasUIB ? "UIB traces detected ✅" : "No UIB device traces detected in this file.");
+  } catch (e) {
+    setStatus("Error", "warn");
+    document.getElementById("results").innerHTML = `<div class="mono">Error: ${e.message}</div>`;
+    logln("ERROR:", e.message);
+    alert(
+      "Parse failed: " + e.message + "\n\n" +
+      "If this is a decompression error, use a newer browser (needs DecompressionStream with deflate-raw)."
+    );
+  }
+});
+
+zipBtn.addEventListener("click", downloadSelectedZip);
+
+setStatus("No file loaded", "warn");
+logln("Ready.");
+</script>
+</body>
+</html>
