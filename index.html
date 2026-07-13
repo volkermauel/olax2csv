@@ -30,12 +30,13 @@
       <input id="file" type="file" accept=".olax" />
       <button id="parseBtn" disabled>Parse</button>
       <button id="zipBtn" disabled>Download selected as ZIP</button>
+      <button id="zipAllBtn" disabled>Download ALL as ZIP</button>
       <span id="status" class="pill warn">No file loaded</span>
     </div>
     <div style="margin-top:10px" class="mono">
       Exports CSV columns: <b>time_ms, time_s, time_min, value</b><br/>
-      Finds traces from <b>injection.acmd</b> and matching <b>TraceId.CH</b>.
-    </div>
+      One <b>.dx</b> per measurement — all are parsed. Traces come from each <b>injection.acmd</b> + matching <b>TraceId.CH</b>.
+      CSV files are prefixed with the sample name (e.g. <b>Blank_…</b>, <b>Sample-001_…</b>).
   </div>
 
   <div class="card">
@@ -341,9 +342,8 @@ function zipStore(files) {
 
 let current = {
   olaxName: "",
+  measurementCount: 0,
   traces: [],        // [{...meta..., selected, csvName, csvText}]
-  olaxZip: null,
-  dxZip: null
 };
 
 function setStatus(text, kind="warn") {
@@ -365,6 +365,7 @@ function renderTraces() {
     return `
       <tr>
         <td><input type="checkbox" data-i="${i}" ${t.selected ? "checked" : ""}></td>
+        <td class="mono">${t.sample || ""}</td>
         <td class="mono">${t.device || ""}</td>
         <td class="mono">${t.channel || ""}</td>
         <td class="mono">${t.units || ""}</td>
@@ -381,12 +382,13 @@ function renderTraces() {
 
   root.innerHTML = `
     <div class="mono" style="margin-bottom:8px;">
-      Found <b>${current.traces.length}</b> trace(s). UIB is usually device <b>UIB</b>, channels <b>UIB1A</b>/<b>UIB1B</b>.
+      Found <b>${current.traces.length}</b> trace(s) across <b>${current.measurementCount}</b> measurement(s).
+      Filenames use <b>&lt;sample&gt;_&lt;device&gt;_&lt;channel&gt;.csv</b>; duplicates get a numeric suffix.
     </div>
     <table>
       <thead>
         <tr>
-          <th>Select</th><th>Device</th><th>Channel</th><th>Units</th><th>N</th><th>Encoding</th><th>Time</th><th>Description</th><th></th>
+          <th>Select</th><th>Sample</th><th>Device</th><th>Channel</th><th>Units</th><th>N</th><th>Encoding</th><th>Time</th><th>Description</th><th></th>
         </tr>
       </thead>
       <tbody>${rows}</tbody>
@@ -407,8 +409,10 @@ function renderTraces() {
 }
 
 function updateZipButton() {
-  const any = current.traces.some(t => t.selected);
-  document.getElementById("zipBtn").disabled = !any;
+  const hasTraces = current.traces.length > 0;
+  const anySelected = current.traces.some(t => t.selected);
+  document.getElementById("zipBtn").disabled = !anySelected;
+  document.getElementById("zipAllBtn").disabled = !hasTraces;
 }
 
 async function downloadOne(i) {
@@ -424,7 +428,7 @@ async function downloadOne(i) {
 async function buildCSVForTrace(t) {
   // load CH bytes
   const chName = `${t.traceId}.CH`;
-  const chBytes = await readZipFile(current.dxZip, chName);
+  const chBytes = await readZipFile(t.dxZip, chName);
 
   let seg = null;
   if (Math.abs(t.min - t.max) < 1e-12 && Math.abs(t.max) < 1e-12) {
@@ -442,20 +446,18 @@ async function buildCSVForTrace(t) {
   for (let i = 0; i < t.n; i++) y[i] = seg.arr[i] * t.slope;
 
   t.csvText = makeCSV(t, y);
-  t.csvName = t.csvName || `${sanitizeName(t.device)}_${sanitizeName(t.channel)}.csv`;
+  // csvName is assigned in parseOlax (unique per measurement + signal).
   t.extractedOffset = seg.off;
 }
 
-async function downloadSelectedZip() {
+async function buildAndDownloadZip(traces, label) {
+  if (!traces.length) return;
   try {
-    const selected = current.traces.filter(t => t.selected);
-    if (!selected.length) return;
-
     setStatus("Building CSV…", "warn");
-    logln("Building CSV for", selected.length, "trace(s)…");
+    logln(`Building CSV for ${traces.length} trace(s) (${label})…`);
 
     const out = [];
-    for (const t of selected) {
+    for (const t of traces) {
       if (!t.csvText) await buildCSVForTrace(t);
       out.push({ name: t.csvName, data: encodeUTF8(t.csvText) });
     }
@@ -465,43 +467,53 @@ async function downloadSelectedZip() {
     downloadBlob(zipBlob, zipName);
 
     setStatus("Done", "ok");
-    logln("ZIP ready:", zipName);
+    logln(`ZIP ready: ${zipName} (${out.length} files)`);
   } catch (e) {
     setStatus("Error", "warn");
     alert("ZIP export failed: " + e.message);
   }
 }
 
-async function parseOlax(arrayBuffer, fileName) {
-  current = { olaxName: fileName, traces: [], olaxZip: null, dxZip: null };
-  document.getElementById("results").innerHTML = `<div class="mono">Parsing…</div>`;
-  document.getElementById("zipBtn").disabled = true;
+function downloadSelectedZip() {
+  return buildAndDownloadZip(current.traces.filter(t => t.selected), "selected");
+}
 
-  const olaxBytes = new Uint8Array(arrayBuffer);
-  const olaxZip = parseZip(olaxBytes);
-  current.olaxZip = olaxZip;
+function downloadAllZip() {
+  return buildAndDownloadZip(current.traces, "all");
+}
 
-  // Find first *.dx inside olax
-  const dxNames = [...olaxZip.files.keys()].filter(n => n.toLowerCase().endsWith(".dx"));
-  if (!dxNames.length) throw new Error("No .dx found inside .olax.");
-  const dxName = dxNames[0];
+function decodeZipName(s) {
+  // .olax stores entries URL-encoded (%2b -> +, %5c -> \)
+  try { return decodeURIComponent(s); } catch (_) { return s; }
+}
 
-  logln("OLAX contains .dx:", dxName);
+function sampleNameFromDxPath(dxPath) {
+  // e.g. "..._2025-01-09+22-16-42+02-00_Blank.dx" -> "Blank"
+  //      "..._2025-01-10+07-40-27+02-00_Sample-001+SST.dx" -> "Sample-001+SST"
+  const decoded = decodeZipName(dxPath);
+  const base = decoded.split(/[\\/]/).pop();
+  const stem = base.replace(/\.dx$/i, "");
+  const idx = stem.lastIndexOf("_");
+  const sample = idx >= 0 ? stem.slice(idx + 1) : stem;
+  return sample || ("measurement_" + Math.random().toString(36).slice(2, 6));
+}
 
+async function parseMeasurement(olaxZip, dxName, measIndex) {
+  const sample = sampleNameFromDxPath(dxName);
   const dxBytes = await readZipFile(olaxZip, dxName);
   const dxZip = parseZip(dxBytes);
-  current.dxZip = dxZip;
 
-  // Find injection.acmd
   const acmdName = [...dxZip.files.keys()].find(n => n.toLowerCase().endsWith("injection.acmd"));
-  if (!acmdName) throw new Error("No injection.acmd found inside .dx.");
+  if (!acmdName) {
+    logln("  (no injection.acmd — skipped)");
+    return [];
+  }
   const acmdBytes = await readZipFile(dxZip, acmdName);
   const acmdText = new TextDecoder("utf-8", {fatal:false}).decode(acmdBytes);
   const doc = xmlParse(acmdText);
 
   const ns = "urn:schemas-agilent-com:acmd20";
   const signals = Array.from(doc.getElementsByTagNameNS(ns, "Signal"));
-  logln("Signals in injection.acmd:", signals.length);
 
   const traces = [];
   for (const s of signals) {
@@ -514,46 +526,92 @@ async function parseOlax(arrayBuffer, fileName) {
     const n = Number(getTextNS(s, ns, "NumberOfValues") || "0");
     if (!Number.isFinite(n) || n <= 0) continue;
 
-    const encoding = getTextNS(s, ns, "Encoding");
-    const device = getTextNS(s, ns, "DeviceName");
-    const channel = getTextNS(s, ns, "ChannelName");
+    const encoding    = getTextNS(s, ns, "Encoding");
+    const device      = getTextNS(s, ns, "DeviceName");
+    const channel     = getTextNS(s, ns, "ChannelName");
     const description = getTextNS(s, ns, "Description");
-    const units = getTextNS(s, ns, "Units");
-    const timeStart = Number(getTextNS(s, ns, "TimeStart") || "0");
-    const timeEnd   = Number(getTextNS(s, ns, "TimeEnd") || "0");
-    const min = Number(getTextNS(s, ns, "Minimum") || "0");
-    const max = Number(getTextNS(s, ns, "Maximum") || "0");
-    const slope = Number(getTextNS(s, ns, "Slope") || "1");
+    const units       = getTextNS(s, ns, "Units");
+    const timeStart   = Number(getTextNS(s, ns, "TimeStart") || "0");
+    const timeEnd     = Number(getTextNS(s, ns, "TimeEnd")   || "0");
+    const min         = Number(getTextNS(s, ns, "Minimum")   || "0");
+    const max         = Number(getTextNS(s, ns, "Maximum")   || "0");
+    const slope       = Number(getTextNS(s, ns, "Slope")     || "1");
 
     const wl = (description.match(/Wavelength\s*=\s*([0-9.]+)\s*nm/i) || [])[1] || "";
-    const csvName = `${sanitizeName(device)}_${sanitizeName(channel)}${wl ? "_" + wl + "nm" : ""}.csv`;
 
     traces.push({
       selected: true,
+      // measurement
+      sample, measIndex, dxName, dxZip,
+      // signal
       traceId, chName,
       device, channel, description, units, encoding,
-      timeStart, timeEnd, min, max, slope, n,
+      timeStart, timeEnd, min, max, slope, n, wl,
       valueHeader: (channel || "value") + (units ? "_" + units : ""),
-      csvName,
-      csvText: null,
-      extractedOffset: null
+      csvName: null, csvText: null, extractedOffset: null
     });
   }
 
-  // Prefer Signal179 (chromatogram-like), but still show everything we can export.
-  traces.sort((a,b) => {
+  logln(`  "${sample}": ${signals.length} signal(s), ${traces.length} trace(s) with data`);
+  return traces;
+}
+
+async function parseOlax(arrayBuffer, fileName) {
+  current = { olaxName: fileName, measurementCount: 0, traces: [] };
+  document.getElementById("results").innerHTML = `<div class="mono">Parsing…</div>`;
+  document.getElementById("zipBtn").disabled = true;
+
+  const olaxBytes = new Uint8Array(arrayBuffer);
+  const olaxZip = parseZip(olaxBytes);
+
+  // Every .dx is one measurement. Skip snapshot-* re-exports (duplicate of an existing run).
+  const dxNames = [...olaxZip.files.keys()].filter(n => {
+    const lc = n.toLowerCase();
+    if (!lc.endsWith(".dx")) return false;
+    if (lc.includes("snapshot-")) return false;
+    return true;
+  });
+  if (!dxNames.length) throw new Error("No .dx found inside .olax.");
+
+  logln(`OLAX contains ${dxNames.length} measurement(s) (.dx)`);
+
+  const allTraces = [];
+  for (let i = 0; i < dxNames.length; i++) {
+    logln(`[${i + 1}/${dxNames.length}] ${dxNames[i]}`);
+    const trs = await parseMeasurement(olaxZip, dxNames[i], i);
+    allTraces.push(...trs);
+  }
+
+  // Order by measurement, then prefer chromatogram (Signal179), then device/channel.
+  allTraces.sort((a, b) => {
+    if (a.measIndex !== b.measIndex) return a.measIndex - b.measIndex;
     const a179 = (a.encoding || "").endsWith("Signal179") ? 0 : 1;
     const b179 = (b.encoding || "").endsWith("Signal179") ? 0 : 1;
     if (a179 !== b179) return a179 - b179;
-    return (a.device || "").localeCompare(b.device || "") || (a.channel || "").localeCompare(b.channel || "");
+    return (a.device || "").localeCompare(b.device || "") ||
+           (a.channel || "").localeCompare(b.channel || "");
   });
 
-  current.traces = traces;
+  // Unique CSV names: <sample>_<device>_<channel>[_<wl>nm].csv — duplicates get _2, _3, …
+  const used = new Set();
+  for (const t of allTraces) {
+    const wlPart = t.wl ? "_" + t.wl + "nm" : "";
+    const base = `${sanitizeName(t.sample)}_${sanitizeName(t.device)}_${sanitizeName(t.channel)}${wlPart}.csv`;
+    let name = base, k = 2;
+    while (used.has(name)) { name = base.replace(/\.csv$/, `_${k}.csv`); k++; }
+    used.add(name);
+    t.csvName = name;
+  }
+
+  current.traces = allTraces;
+  current.measurementCount = dxNames.length;
   renderTraces();
   updateZipButton();
 
-  setStatus(`Parsed: ${traces.length} trace(s)`, traces.length ? "ok" : "warn");
-  logln("Traces ready:", traces.length);
+  const hasUIB = allTraces.some(t => (t.device || "").toUpperCase() === "UIB");
+  setStatus(`Parsed: ${dxNames.length} measurement(s), ${allTraces.length} trace(s)`, allTraces.length ? "ok" : "warn");
+  logln(`Traces ready: ${allTraces.length} across ${dxNames.length} measurement(s).`);
+  logln(hasUIB ? "UIB traces detected ✅" : "No UIB device traces detected in this file.");
 }
 
 /* ============================
@@ -579,10 +637,6 @@ parseBtn.addEventListener("click", async () => {
     logln("Loading:", f.name, "(" + f.size + " bytes)");
     const ab = await f.arrayBuffer();
     await parseOlax(ab, f.name);
-
-    // quick hint: show if UIB exists
-    const hasUIB = current.traces.some(t => (t.device || "").toUpperCase() === "UIB");
-    logln(hasUIB ? "UIB traces detected ✅" : "No UIB device traces detected in this file.");
   } catch (e) {
     setStatus("Error", "warn");
     document.getElementById("results").innerHTML = `<div class="mono">Error: ${e.message}</div>`;
@@ -595,6 +649,7 @@ parseBtn.addEventListener("click", async () => {
 });
 
 zipBtn.addEventListener("click", downloadSelectedZip);
+document.getElementById("zipAllBtn").addEventListener("click", downloadAllZip);
 
 setStatus("No file loaded", "warn");
 logln("Ready.");
