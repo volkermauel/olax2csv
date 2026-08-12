@@ -1,0 +1,13 @@
+{
+  "name": "olax2csv",
+  "version": "1.0.0",
+  "private": true,
+  "description": "OpenLab CDS .OLAX → CSV / XLSX converter (single-file HTML, offline)",
+  "scripts": {
+    "test": "node --test"
+  },
+  "devDependencies": {
+    "@xmldom/xmldom": "^0.8.10",
+    "xlsx": "0.18.5"
+  }
+}

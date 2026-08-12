@@ -1,0 +1,18 @@
+# Dependencies
+node_modules/
+
+# Real data — NEVER commit OpenLab exports (contain sample/patient PII)
+*.olax
+*.OLAX
+
+# Generated test fixtures (built at test time from test/fixtures/build-olax.mjs)
+test/fixtures/*.olax
+
+# pi agent session data
+.pi/
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+*.swp
+*~
