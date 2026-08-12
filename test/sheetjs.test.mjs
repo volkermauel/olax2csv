@@ -23,8 +23,8 @@ function embeddedSheetJSBlob() {
 test('embedded SheetJS blob is syntactically valid (parses as a function body)', () => {
   const blob = embeddedSheetJSBlob();
   assert.ok(blob.length > 500_000, `blob looks too small (${blob.length} bytes)`);
-  // Construct a function — throws SyntaxError on malformed JS.
-  new Function(blob);
+  // Compile-only (no execute): throws SyntaxError on malformed JS.
+  new vm.Script(blob);
   // Guard against the specific corruption markers from the original broken embed.
   assert.equal(blob.includes('XLSX_LIBRARY'), false, 'blob contains corruption marker "XLSX_LIBRARY"');
 });

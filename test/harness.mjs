@@ -24,7 +24,9 @@ const APP_CODE = m[1] + [
   // Expose top-level `let`/`const` bindings (which don't become global properties
   // the way `var`/`function` do) so tests can reach into the evaluated script.
   ';globalThis.store = store;',
-  ';globalThis.PEAK_HEADER = PEAK_HEADER; globalThis.COMPOUND_HEADER = COMPOUND_HEADER; globalThis.CALIB_HEADER = CALIB_HEADER; globalThis.INJ_HEADER = INJ_HEADER;'
+  ';globalThis.PEAK_HEADER = PEAK_HEADER; globalThis.COMPOUND_HEADER = COMPOUND_HEADER; globalThis.CALIB_HEADER = CALIB_HEADER; globalThis.INJ_HEADER = INJ_HEADER;',
+  // Worker machinery — the worker tests compose the REAL worker source from these.
+  ';globalThis.parseZip = parseZip; globalThis.groupByRslt = groupByRslt; globalThis.getFileSlice = getFileSlice; globalThis.buildWorkerSource = buildWorkerSource; globalThis.buildWorkerMessage = buildWorkerMessage; globalThis.parseContainerParallel = parseContainerParallel; globalThis.WORKER_FNS = WORKER_FNS;',
 ].join('\n');
 
 // xmldom has no querySelector; the app uses doc.querySelector("parsererror").
