@@ -23,11 +23,11 @@ jobs:
       - name: Verify no tracked data files
         run: |
           set -e
-          if git ls-files | grep -iE '\.olax$|^\.pi/'; then
-            echo "::error::Refusing to build: tracked .olax (sample/patient PII) or .pi/ files detected"
+          if git ls-files | grep -iE '\.(olax|zip|rar|7z)$|^\.pi/'; then
+            echo "::error::Refusing to build: tracked OpenLab data export (.olax/.zip/.rar/.7z = sample/patient PII) or .pi/ files detected"
             exit 1
           fi
-          echo "OK: no .olax or .pi/ files are tracked."
+          echo "OK: no .olax/.zip/.rar/.7z or .pi/ files are tracked."
 
   test:
     name: Test (Node ${{ matrix.node }})

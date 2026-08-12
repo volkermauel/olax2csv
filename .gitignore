@@ -2,11 +2,17 @@
 node_modules/
 
 # Real data — NEVER commit OpenLab exports (contain sample/patient PII)
+#   .olax  = single OPC result package
+#   .zip/.rar/.7z = Content Manager multi-result exports (e.g. 2026.zip)
 *.olax
 *.OLAX
+*.zip
+*.rar
+*.7z
 
 # Generated test fixtures (built at test time from test/fixtures/build-olax.mjs)
 test/fixtures/*.olax
+test/fixtures/*.zip
 
 # pi agent session data
 .pi/
