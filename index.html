@@ -31,7 +31,7 @@
 
   <div class="card">
     <div class="row">
-      <input id="file" type="file" accept=".olax" multiple />
+      <input id="file" type="file" accept=".olax,.zip" multiple />
       <button id="parseBtn" disabled>Parse</button>
       <button id="clearBtn" disabled>Clear</button>
       <span id="status" class="pill warn">No file loaded</span>
@@ -138,7 +138,27 @@ function parseZip(u8) {
     const nameBytes = u8.slice(p + 46, p + 46 + nameLen);
     const name = decodeUTF8(nameBytes);
 
-    files.set(name, { name, gpFlags, method, crc, cSize, uSize, lho });
+    // ZIP64: when a central-directory value is 0xFFFFFFFF, the real 64-bit value
+    // lives in the extra field (header id 0x0001), in fixed order: uSize, cSize, lho
+    // (only the placeholder fields are present).
+    let zCSize = cSize, zUSize = uSize, zLho = lho;
+    const exOff = p + 46 + nameLen;
+    let eo = exOff;
+    while (eo + 4 <= exOff + extraLen) {
+      const eid = u16(dv, eo);
+      const esz = u16(dv, eo + 2);
+      eo += 4;
+      if (eid === 0x0001) {
+        let o = eo;
+        if ((uSize >>> 0) === 0xFFFFFFFF) { zUSize = Number(dv.getBigUint64(o, true)); o += 8; }
+        if ((cSize >>> 0) === 0xFFFFFFFF) { zCSize = Number(dv.getBigUint64(o, true)); o += 8; }
+        if ((lho   >>> 0) === 0xFFFFFFFF) { zLho   = Number(dv.getBigUint64(o, true)); o += 8; }
+        break;
+      }
+      eo += esz;
+    }
+
+    files.set(name, { name, gpFlags, method, crc, cSize: zCSize, uSize: zUSize, lho: zLho });
     p = p + 46 + nameLen + extraLen + commentLen;
   }
   return { files, dv, u8 };
@@ -429,7 +449,8 @@ const PEAK_HEADER = [
   "Baseline code","Baseline start","Baseline end","Level start","Level end",
   "Theoretical plates (EP)","Resolution (EP)","Tailing factor",
   "Width base","Width 5sigma","Width 5%","Width 10%","Width 50%","Width tangent",
-  "Noise","Signal/noise","Asymmetry 10%","Purity passed","MS purity passed","Baseline model"
+  "Noise","Signal/noise","Asymmetry 10%","Purity passed","MS purity passed","Baseline model",
+  "Instrument","Instrument type","Result set"
 ];
 
 function peakRow(peak, ctx) {
@@ -459,7 +480,8 @@ const COMPOUND_HEADER = [
   "Area","Height","Response factor","RF calc mode","Quantitation type",
   "Expected RT (min)","Corr. exp. RT (min)","Multiplier","Internal standard","Time ref",
   "Scaled response","ID window begin","ID window end","Time range begin","Time range end",
-  "Spectra confirm"
+  "Spectra confirm",
+  "Instrument","Instrument type","Result set"
 ];
 
 function compoundRow(ic, ctx) {
@@ -497,7 +519,8 @@ function compoundRow(ic, ctx) {
 const CALIB_HEADER = [
   "Source file","Compound","Curve type","Formula","Origin","Weight",
   "Corr. coeff","Residual","Coeff A","Coeff B","Coeff C",
-  "Level","Amount","Amount unit","Avg response","Avg response abs","Relative residual %"
+  "Level","Amount","Amount unit","Avg response","Avg response abs","Relative residual %",
+  "Instrument","Instrument type","Result set"
 ];
 
 function calibrationRows(curve, ctx, compoundFor) {
@@ -559,7 +582,8 @@ const INJ_HEADER = [
   "Source file","Sample","Inj.#","Processed by","Created","Last modified",
   "Order no","Sample bracketing","Integrator","Noise type","Calibration changed",
   "Reprocessing required","# standards","Standards","# signals","# peaks","# compounds",
-  "Processing status"
+  "Processing status",
+  "Instrument","Instrument type","Result set"
 ];
 
 function injectionRow(result, ctx, counts) {
@@ -621,6 +645,8 @@ function injectionRow(result, ctx, counts) {
 // Returns { peaks:[[]], compounds:[[]], calibration:[[]], injection:[], counts }
 function parseInjectionACAML(xmlText, signalMap, ctx) {
   const out = { peaks: [], compounds: [], calibration: [], injection: [], counts: { signals: 0, peaks: 0, compounds: 0 } };
+  // Trailing columns appended to every row: Instrument / Instrument type / Result set.
+  const META = [ctx.instrument || "", ctx.instrumentType || "", ctx.resultSet || ""];
   if (!xmlText) return out;
   let doc;
   try { doc = xmlParse(xmlText); } catch (e) { return out; }
@@ -647,7 +673,7 @@ function parseInjectionACAML(xmlText, signalMap, ctx) {
 
   // Calibration rows (global to the injection, in Resources)
   for (const curve of curves) {
-    out.calibration.push(...calibrationRows(curve, ctx, compoundFor));
+    out.calibration.push(...calibrationRows(curve, ctx, compoundFor).map(r => r.concat(META)));
   }
 
   // Signal results -> peaks
@@ -662,19 +688,19 @@ function parseInjectionACAML(xmlText, signalMap, ctx) {
     let peakNo = 0;
     for (const pk of peaks) {
       peakNo++;
-      out.peaks.push(peakRow(pk, Object.assign({}, srCtx, { peakNo })));
+      out.peaks.push(peakRow(pk, Object.assign({}, srCtx, { peakNo })).concat(META));
       out.counts.peaks++;
     }
   }
 
   // Compounds
   for (const ic of compoundsAll) {
-    out.compounds.push(compoundRow(ic, ctx));
+    out.compounds.push(compoundRow(ic, ctx).concat(META));
     out.counts.compounds++;
   }
 
   // Injection summary
-  out.injection = injectionRow(result, ctx, out.counts);
+  out.injection = injectionRow(result, ctx, out.counts).concat(META);
   return out;
 }
 
@@ -737,21 +763,26 @@ async function buildCSVForTrace(t) {
   t.extractedOffset = seg.off;
 }
 
-async function parseMeasurementTraces(olaxZip, dxName, measIndex, sourceFile, srcStem) {
-  const sample = sampleNameFromDxPath(dxName);
-  const dxBytes = await readZipFile(olaxZip, dxName);
+async function parseMeasurementTraces(zipView, dxName, measIndex, meta, srcStem) {
+  const dxBytes = await readZipFile(zipView, dxName);
   const dxZip = parseZip(dxBytes);
 
   const acmdName = [...dxZip.files.keys()].find(n => n.toLowerCase().endsWith("injection.acmd"));
   if (!acmdName) {
     logln("  (no injection.acmd — skipped traces)");
-    return [];
+    return { traces: [], sample: sampleNameFromDxPath(dxName) };
   }
   const acmdBytes = await readZipFile(dxZip, acmdName);
-  const acmdText = new TextDecoder("utf-8", {fatal:false}).decode(acmdBytes);
+  const acmdText = new TextDecoder("utf-8", { fatal: false }).decode(acmdBytes);
   const doc = xmlParse(acmdText);
 
   const ns = "urn:schemas-agilent-com:acmd20";
+  // Prefer the sample name embedded in the .dx metadata (always present, and the only
+  // source for Content-Manager exports whose .dx filename is just a timestamp).
+  const acmdSample = (getTextNS(doc.documentElement, ns, "SampleName") || "").trim();
+  const sample = acmdSample || sampleNameFromDxPath(dxName);
+  const sourceFile = meta.resultSetLabel || meta.containerName || "";
+
   const signals = Array.from(doc.getElementsByTagNameNS(ns, "Signal"));
 
   const traces = [];
@@ -785,31 +816,40 @@ async function parseMeasurementTraces(olaxZip, dxName, measIndex, sourceFile, sr
       traceId, chName,
       device, channel, description, units, encoding,
       timeStart, timeEnd, min, max, slope, n, wl,
+      instrument: meta.instrument || "",
+      instrumentType: meta.instrumentType || "",
+      resultSet: meta.resultSetLabel || "",
       valueHeader: (channel || "value") + (units ? "_" + units : ""),
       csvName: null, csvText: null, extractedOffset: null
     });
   }
 
   logln(`  "${sample}": ${signals.length} signal(s), ${traces.length} trace(s)`);
-  return traces;
+  return { traces, sample };
 }
 
-// Parse the .rx for a given .dx name; return parsed results rows.
-async function parseMeasurementResults(olaxZip, dxName, measIndex, sourceFile, signalMap) {
+// Parse the .rx for a given .dx name; return parsed result rows.
+async function parseMeasurementResults(zipView, dxName, measIndex, meta, signalMap) {
   const rxName = dxName.replace(/\.dx$/i, ".rx");
-  const sample = sampleNameFromDxPath(dxName);
-  const ctx = { sourceFile, sample, injNo: measIndex + 1 };
-  if (!olaxZip.files.has(rxName)) {
+  const sample = meta.sample || sampleNameFromDxPath(dxName);
+  const ctx = {
+    sourceFile: meta.resultSetLabel || meta.containerName || "",
+    sample, injNo: measIndex + 1,
+    instrument: meta.instrument || "",
+    instrumentType: meta.instrumentType || "",
+    resultSet: meta.resultSetLabel || ""
+  };
+  if (!zipView.files.has(rxName)) {
     return { peaks: [], compounds: [], calibration: [], injections: [], counts: { signals: 0, peaks: 0, compounds: 0 }, hadResults: false };
   }
   try {
-    const rxBytes = await readZipFile(olaxZip, rxName);
+    const rxBytes = await readZipFile(zipView, rxName);
     const rxZip = parseZip(rxBytes);
     const partName = [...rxZip.files.keys()].find(n => n.toLowerCase().endsWith("injectionacaml"));
     if (!partName) return { peaks: [], compounds: [], calibration: [], injections: [], counts: { signals: 0, peaks: 0, compounds: 0 }, hadResults: false };
     const xmlBytes = await readZipFile(rxZip, partName);
     // strip a possible UTF-8 BOM
-    let xmlText = new TextDecoder("utf-8", {fatal:false}).decode(xmlBytes);
+    let xmlText = new TextDecoder("utf-8", { fatal: false }).decode(xmlBytes);
     xmlText = xmlText.replace(/^\uFEFF/, "");
     const parsed = parseInjectionACAML(xmlText, signalMap, ctx);
     parsed.hadResults = true;
@@ -823,49 +863,134 @@ async function parseMeasurementResults(olaxZip, dxName, measIndex, sourceFile, s
   }
 }
 
-async function parseOlax(arrayBuffer, fileName) {
-  document.getElementById("results").innerHTML = `<div class="mono">Parsing ${fileName}…</div>`;
+/* =============== Content-Manager (.rslt) container support ===============
+   A single .olax is an OPC package wrapping ONE ".rslt" folder (its in-package
+   separator is the backslash, percent-encoded as "%5c"). A Content-Manager export
+   is a plain zip containing MANY ".rslt" folders at arbitrary depth. Both are
+   handled by the same grouper: normalise the path, find the ".rslt" segment,
+   and process each ".rslt" folder as one result set. */
 
-  const olaxBytes = new Uint8Array(arrayBuffer);
-  const olaxZip = parseZip(olaxBytes);
+function normZipPath(name) {
+  return name.replace(/%5c/gi, "/").replace(/\\/g, "/").split("/");
+}
 
+function groupByRslt(outer) {
+  const groups = new Map();
+  for (const [name, entry] of outer.files) {
+    const segs = normZipPath(name);
+    let idx = -1;
+    for (let i = segs.length - 1; i >= 0; i--) {
+      if (/\.rslt$/i.test(segs[i])) { idx = i; break; }
+    }
+    if (idx < 0) continue;                 // not inside a .rslt folder (OPC metadata, _rels, …)
+    const within = segs.slice(idx + 1).join("/");
+    if (!within) continue;                  // the folder entry itself
+    const key = segs.slice(0, idx + 1).join("/");
+    if (!groups.has(key)) groups.set(key, { key, folderName: segs[idx], entries: [] });
+    groups.get(key).entries.push({ within, name });
+  }
+  return groups;
+}
+
+// A zip "view" scoped to one .rslt group: files re-keyed by within-group path,
+// while dv/u8/entry.lho still reference the OUTER container so readZipFile works unchanged.
+function makeGroupView(outer, group) {
+  const files = new Map();
+  for (const e of group.entries) files.set(e.within, outer.files.get(e.name));
+  return { files, dv: outer.dv, u8: outer.u8 };
+}
+
+// Classify HPLC vs GC from the .amx acquisition-method package (a nested zip).
+// Only the DeviceMethodSettings/ entry NAMES are needed (central directory; no inflate):
+//   HPLC -> AgilentPumpDriver / AgilentVwdDriver / AgilentSamplerDriver / AgilentColumnCompDriver / …
+//   GC   -> a single "GC<#>" driver module (e.g. GC6%0)
+function classifyAmx(amxBytes) {
+  try {
+    const z = parseZip(amxBytes);
+    const drv = [...z.files.keys()]
+      .filter(n => n.toLowerCase().includes("devicemethodsettings/"))
+      .map(n => n.split("/").pop().toUpperCase());
+    const has = re => drv.some(d => re.test(d));
+    const hasLC = has(/PUMP|VWD|DAD|RID|COLUMNCOMP|SAMPLER|DECADE/);
+    const hasGC = has(/^GC[0-9]/) || has(/GCDRIVER|OVENPROGRAM|INLET/);
+    if (hasGC && !hasLC) return "GC";
+    if (hasLC && !hasGC) return "HPLC";
+  } catch (_) {}
+  return null;
+}
+
+function classifyByFolderName(rsltFolderName) {
+  const m = (rsltFolderName || "").match(/\b(HPLC|GC|LC|CE|SFC|IC)[-_ ]?[0-9]/i);
+  return m ? m[1].toUpperCase() : null;
+}
+
+function instrumentLabelFromFolder(rsltFolderName) {
+  const m = (rsltFolderName || "").match(/\b(HPLC|GC|LC|CE|SFC|IC)[-_ ]?([0-9]+)/i);
+  return m ? (m[1].toUpperCase() + m[2]) : "";
+}
+
+async function detectGroupMeta(view, rsltFolderName, containerName) {
+  let type = null;
+  const amxName = [...view.files.keys()].find(n => {
+    const lc = n.toLowerCase();
+    return lc.endsWith(".amx") && !lc.includes("snapshot-");
+  });
+  if (amxName) {
+    try { type = classifyAmx(await readZipFile(view, amxName)); } catch (_) {}
+  }
+  if (!type) type = classifyByFolderName(rsltFolderName) || "Other";
+  const label = (rsltFolderName || containerName || "").replace(/\.rslt$/i, "");
+  return {
+    containerName: containerName || "",
+    resultSetLabel: label,
+    instrument: instrumentLabelFromFolder(rsltFolderName) || (containerName || "").replace(/\.(olax|zip)$/i, ""),
+    instrumentType: type
+  };
+}
+
+// Process one ".rslt" result set (or a flat single-result zip) into store.files.
+async function processResultSet(view, meta) {
   // Every .dx is one measurement. Skip snapshot-* re-exports (duplicate of an existing run).
-  const dxNames = [...olaxZip.files.keys()].filter(n => {
+  const dxNames = [...view.files.keys()].filter(n => {
     const lc = n.toLowerCase();
     if (!lc.endsWith(".dx")) return false;
     if (lc.includes("snapshot-")) return false;
     return true;
   });
-  if (!dxNames.length) throw new Error("No .dx found inside .olax.");
+  if (!dxNames.length) {
+    logln(`  Result set "${meta.resultSetLabel}": no .dx — skipped.`);
+    return;
+  }
 
   // Root .acaml -> signal registry (one per result set)
-  const acamlName = [...olaxZip.files.keys()].find(n => n.toLowerCase().endsWith(".acaml"));
+  const acamlName = [...view.files.keys()].find(n => n.toLowerCase().endsWith(".acaml"));
   let signalMap = new Map();
   if (acamlName) {
     try {
-      const ab = await readZipFile(olaxZip, acamlName);
-      let txt = new TextDecoder("utf-8", {fatal:false}).decode(ab).replace(/^\uFEFF/, "");
+      const ab = await readZipFile(view, acamlName);
+      let txt = new TextDecoder("utf-8", { fatal: false }).decode(ab).replace(/^\uFEFF/, "");
       signalMap = buildSignalMap(txt);
-      logln(`Signal registry: ${signalMap.size} signal(s) from ${decodeZipName(acamlName).split(/[\\/]/).pop()}`);
+      logln(`  Signal registry: ${signalMap.size} signal(s) from ${decodeZipName(acamlName).split(/[\\/]/).pop()}`);
     } catch (e) {
-      logln(`Signal registry parse error: ${e.message}`);
+      logln(`  Signal registry parse error: ${e.message}`);
     }
   } else {
-    logln("No root .acaml found — peak signal names may be missing.");
+    logln("  No root .acaml found — peak signal names may be missing.");
   }
 
-  logln(`OLAX "${fileName}": ${dxNames.length} measurement(s) (.dx)`);
+  logln(`  Result set "${meta.resultSetLabel}" [${meta.instrumentType}]: ${dxNames.length} measurement(s)`);
 
-  const srcStem = sanitizeName(fileName.replace(/\.olax$/i, ""));
+  const srcStem = sanitizeName((meta.containerName || meta.resultSetLabel).replace(/\.(olax|zip)$/i, ""));
   const traces = [];
   const results = { peaks: [], compounds: [], calibration: [], injections: [] };
   let resultsFound = 0;
 
   for (let i = 0; i < dxNames.length; i++) {
-    logln(`[${i + 1}/${dxNames.length}] ${dxNames[i]}`);
-    const trs = await parseMeasurementTraces(olaxZip, dxNames[i], i, fileName, srcStem);
-    for (const t of trs) traces.push(t);
-    const res = await parseMeasurementResults(olaxZip, dxNames[i], i, fileName, signalMap);
+    logln(`  [${i + 1}/${dxNames.length}] ${dxNames[i]}`);
+    const tr = await parseMeasurementTraces(view, dxNames[i], i, meta, srcStem);
+    for (const t of tr.traces) traces.push(t);
+    const m2 = Object.assign({}, meta, { sample: tr.sample });
+    const res = await parseMeasurementResults(view, dxNames[i], i, m2, signalMap);
     if (res.hadResults) resultsFound++;
     results.peaks.push(...res.peaks);
     results.compounds.push(...res.compounds);
@@ -894,19 +1019,55 @@ async function parseOlax(arrayBuffer, fileName) {
            (a.channel || "").localeCompare(b.channel || "");
   });
 
-  store.files.push({ name: fileName, measurementCount: dxNames.length, traces, results });
+  store.files.push({
+    name: meta.resultSetLabel || meta.containerName,
+    container: meta.containerName,
+    instrument: meta.instrument,
+    instrumentType: meta.instrumentType,
+    measurementCount: dxNames.length,
+    traces, results
+  });
 
-  logln(`Done "${fileName}": ${traces.length} trace(s); results for ${resultsFound}/${dxNames.length} measurement(s) ` +
+  logln(`  Done "${meta.resultSetLabel}" [${meta.instrumentType}]: ${traces.length} trace(s); results for ${resultsFound}/${dxNames.length} ` +
         `(peaks=${results.peaks.length}, compounds=${results.compounds.length}, calib=${results.calibration.length}).`);
+}
+
+// Entry point for BOTH a single .olax (one .rslt, OPC-encoded) and a Content-Manager
+// .zip (many .rslt folders at depth). Each .rslt becomes one store.files entry.
+async function parseContainer(arrayBuffer, fileName) {
+  document.getElementById("results").innerHTML = `<div class="mono">Parsing ${fileName}…</div>`;
+
+  const outer = parseZip(new Uint8Array(arrayBuffer));
+  const groups = [...groupByRslt(outer).values()];
+
+  let work;
+  if (groups.length) {
+    work = groups.map(g => ({ view: makeGroupView(outer, g), folderName: g.folderName }));
+    logln(`Container "${fileName}": ${groups.length} result set(s) (.rslt).`);
+  } else {
+    // Back-compat: flat single-result zip with .dx directly (e.g. the synthetic test fixture).
+    const dxAny = [...outer.files.keys()].some(n => n.toLowerCase().endsWith(".dx"));
+    if (!dxAny) throw new Error(`No .rslt folders and no .dx found inside "${fileName}".`);
+    work = [{ view: outer, folderName: fileName }];
+    logln(`Container "${fileName}": no .rslt folders — treating whole zip as one result set.`);
+  }
+
+  for (const w of work) {
+    const meta = await detectGroupMeta(w.view, w.folderName, fileName);
+    await processResultSet(w.view, meta);
+  }
 
   renderAll();
   const totTr = allTraces().length;
   const totRes = allResults();
   setStatus(
-    `${store.files.length} file(s): ${totTr} trace(s), ${totRes.peaks.length} peak(s), ${totRes.compounds.length} compound(s)`,
+    `${store.files.length} result set(s): ${totTr} trace(s), ${totRes.peaks.length} peak(s), ${totRes.compounds.length} compound(s)`,
     totTr ? "ok" : "warn"
   );
 }
+
+// Back-compat alias (existing callers / tests use parseOlax).
+async function parseOlax(arrayBuffer, fileName) { return parseContainer(arrayBuffer, fileName); }
 
 /* ---- rendering ---- */
 
@@ -994,16 +1155,48 @@ function renderTable(header, rows, emptyMsg) {
   return `<table><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table>`;
 }
 
+let activeInstrFilter = "all";   // instrument-type filter for the results tables
+
+function distinctInstrumentTypes() {
+  const res = allResults();
+  const set = new Set();
+  for (const r of res.peaks)       set.add(r[PEAK_HEADER.indexOf("Instrument type")]);
+  for (const r of res.compounds)   set.add(r[COMPOUND_HEADER.indexOf("Instrument type")]);
+  for (const r of res.injections)  set.add(r[INJ_HEADER.indexOf("Instrument type")]);
+  for (const r of res.calibration) set.add(r[CALIB_HEADER.indexOf("Instrument type")]);
+  return [...set].filter(t => t).sort();
+}
+
 function renderResultsTab() {
   const root = document.getElementById("results");
   const res = allResults();
-  let html = "";
-  if (activeTab === "peaks")      html = renderTable(PEAK_HEADER, res.peaks, "No peaks found (some files may have no .rx / no integrated peaks).");
-  else if (activeTab === "compounds")  html = renderTable(COMPOUND_HEADER, res.compounds, "No compounds found.");
-  else if (activeTab === "calibration")html = renderTable(CALIB_HEADER, res.calibration, "No calibration data found.");
-  else if (activeTab === "injections") html = renderTable(INJ_HEADER, res.injections, "No injection summaries found.");
+  let header, rows, emptyMsg;
+  if (activeTab === "peaks")          { header = PEAK_HEADER;     rows = res.peaks;       emptyMsg = "No peaks found (some files may have no .rx / no integrated peaks)."; }
+  else if (activeTab === "compounds") { header = COMPOUND_HEADER; rows = res.compounds;   emptyMsg = "No compounds found."; }
+  else if (activeTab === "calibration"){ header = CALIB_HEADER;   rows = res.calibration; emptyMsg = "No calibration data found."; }
+  else if (activeTab === "injections") { header = INJ_HEADER;     rows = res.injections;  emptyMsg = "No injection summaries found."; }
   else return;
+
+  // Instrument-type filter (only relevant when more than one type is present)
+  let html = "";
+  const types = distinctInstrumentTypes();
+  if (types.length > 1) {
+    const opts = [`<option value="all"${activeInstrFilter === "all" ? " selected" : ""}>All instruments</option>`]
+      .concat(types.map(t => `<option value="${t}"${activeInstrFilter === t ? " selected" : ""}>${t}</option>`))
+      .join("");
+    html += `<div style="margin:6px 0"><label class="mono">Instrument: </label><select id="instrFilter">${opts}</select></div>`;
+  }
+  let shown = rows;
+  if (types.length > 1 && activeInstrFilter !== "all") {
+    const ti = header.indexOf("Instrument type");
+    shown = rows.filter(r => r[ti] === activeInstrFilter);
+  }
+  const msg = (types.length > 1 && activeInstrFilter !== "all")
+    ? `No ${activeInstrFilter} rows. (Pick "All instruments" or another tab.)` : emptyMsg;
+  html += renderTable(header, shown, msg);
   root.innerHTML = html;
+  const sel = document.getElementById("instrFilter");
+  if (sel) sel.addEventListener("change", () => { activeInstrFilter = sel.value; renderResultsTab(); });
 }
 
 function renderAll() {
@@ -1086,17 +1279,49 @@ function downloadExcel() {
     logln(`Building XLSX: peaks=${res.peaks.length}, compounds=${res.compounds.length}, calib=${res.calibration.length}, inj=${res.injections.length}`);
 
     const wb = XLSX.utils.book_new();
-    XLSX.utils.book_append_sheet(wb, aoaToSheet(INJ_HEADER,    res.injections),  "Injections");
-    XLSX.utils.book_append_sheet(wb, aoaToSheet(PEAK_HEADER,   res.peaks),       "Peaks");
-    XLSX.utils.book_append_sheet(wb, aoaToSheet(COMPOUND_HEADER,res.compounds),   "Compounds");
-    if (res.calibration.length)
-      XLSX.utils.book_append_sheet(wb, aoaToSheet(CALIB_HEADER, res.calibration), "Calibration");
+    const pti = PEAK_HEADER.indexOf("Instrument type");
+    const cti = COMPOUND_HEADER.indexOf("Instrument type");
+    const kti = CALIB_HEADER.indexOf("Instrument type");
+    const iti = INJ_HEADER.indexOf("Instrument type");
+
+    // Distinct instrument types, stable order (HPLC, GC, LC, … then alpha).
+    const order = ["HPLC", "GC", "LC", "CE", "SFC", "IC"];
+    const typeSet = new Set();
+    for (const r of res.peaks)       typeSet.add(r[pti]);
+    for (const r of res.compounds)   typeSet.add(r[cti]);
+    for (const r of res.injections)  typeSet.add(r[iti]);
+    for (const r of res.calibration) typeSet.add(r[kti]);
+    const types = [...typeSet].filter(t => t).sort((a, b) => {
+      const ia = order.indexOf(a), ib = order.indexOf(b);
+      return (ia < 0 ? 99 : ia) - (ib < 0 ? 99 : ib) || a.localeCompare(b);
+    });
+
+    // Excel sheet names: <=31 chars, no : \ / ? * [ ]
+    const sheetName = (base, suffix) =>
+      (suffix ? `${base} (${suffix})` : base).replace(/[:\\/?*\[\]]/g, "").slice(0, 31);
+
+    const addSet = (suffix) => {
+      const p   = suffix ? res.peaks.filter(r => r[pti] === suffix)       : res.peaks;
+      const c   = suffix ? res.compounds.filter(r => r[cti] === suffix)   : res.compounds;
+      const k   = suffix ? res.calibration.filter(r => r[kti] === suffix) : res.calibration;
+      const inj = suffix ? res.injections.filter(r => r[iti] === suffix)  : res.injections;
+      XLSX.utils.book_append_sheet(wb, aoaToSheet(INJ_HEADER,     inj), sheetName("Injections", suffix));
+      XLSX.utils.book_append_sheet(wb, aoaToSheet(PEAK_HEADER,    p),   sheetName("Peaks", suffix));
+      XLSX.utils.book_append_sheet(wb, aoaToSheet(COMPOUND_HEADER, c),   sheetName("Compounds", suffix));
+      if (k.length)
+        XLSX.utils.book_append_sheet(wb, aoaToSheet(CALIB_HEADER,  k),   sheetName("Calibration", suffix));
+    };
+
+    // >1 instrument type -> one sheet set per type; otherwise a single plain set.
+    if (types.length > 1) types.forEach(t => addSet(t));
+    else addSet(null);
 
     const arr = XLSX.write(wb, { type: "array", bookType: "xlsx" });
     const blob = new Blob([arr], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" });
-    const name = (store.files.length === 1
-      ? sanitizeName(store.files[0].name.replace(/\.olax$/i,""))
-      : "olax_results") + "_results.xlsx";
+    const baseName = store.files.length === 1
+      ? sanitizeName((store.files[0].name || "olax").replace(/\.(olax|zip)$/i, ""))
+      : "olax_results";
+    const name = (types.length > 1 ? "results_by_instrument" : baseName + "_results") + ".xlsx";
     downloadBlob(blob, name);
 
     setStatus("Done", "ok");

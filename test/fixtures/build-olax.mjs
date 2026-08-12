@@ -82,27 +82,27 @@ export function makeZip(entries) {
   return out;
 }
 
-const enc = (s) => new TextEncoder().encode(s);
+export const enc = (s) => new TextEncoder().encode(s);
 
 /* ---------- known, fixed test constants ---------- */
 
-const SIG1   = '11111111-1111-4111-8111-111111111111'; // detector signal GUID
-const TRACE1 = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1'; // gaussian trace
-const TRACE2 = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbb2'; // all-zero trace
-const CALIB  = 'cccccccc-cccc-4ccc-8ccc-cccccccccccc'; // calibration curve
+export const SIG1   = '11111111-1111-4111-8111-111111111111'; // detector signal GUID
+export const TRACE1 = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1'; // gaussian trace
+export const TRACE2 = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbb2'; // all-zero trace
+export const CALIB  = 'cccccccc-cccc-4ccc-8ccc-cccccccccccc'; // calibration curve
 
-const PEAK = {
+export const PEAK = {
   rt: 5.0, type: 'NormalPeak', area: 1234.5, areaUnit: 'mAU·s',
   areaPct: 98.5, height: 100, heightUnit: 'mAU', begin: 4.8, end: 5.2,
   baselineCode: 'BB', sn: 500, plates: 10000, resolution: 2.5,
   purity: 'true', baselineModel: 'Linear',
 };
-const COMPOUND = {
+export const COMPOUND = {
   name: 'ANALYTE', type: 'Expected', amount: 10, amountUnit: 'µg/ml',
   conc: 10, concUnit: 'µg/ml', area: 1234.5, height: 100,
   expRT: 5.0, expSignal: 'SIM1', quantType: 'Area',
 };
-const CALIBRATION = {
+export const CALIBRATION = {
   compound: 'ANALYTE', type: 'Linear', formula: 'y = ax + b',
   origin: 'Include', weight: 'None', r: 0.999, residual: 1.5,
   a: 10, b: 0.5, c: 0,
@@ -112,7 +112,7 @@ const CALIBRATION = {
 
 /* ---------- XML builders ---------- */
 
-function acamlRegistry() {
+export function acamlRegistry() {
   return `<?xml version="1.0" encoding="utf-8"?>
 <ACAML xmlns="urn:schemas-agilent-com:acaml21" schemaversion="2.1.30.999">
  <Doc><Content><Resources>
@@ -121,9 +121,9 @@ function acamlRegistry() {
 </ACAML>`;
 }
 
-function acmdInjection(N1, min1, max1, tEnd1, N2, tEnd2) {
+export function acmdInjection(N1, min1, max1, tEnd1, N2, tEnd2, sampleName) {
   return `<?xml version="1.0" encoding="utf-8"?>
-<Injection xmlns="urn:schemas-agilent-com:acmd20">
+<Injection xmlns="urn:schemas-agilent-com:acmd20">${sampleName ? `\n  <SampleName>${sampleName}</SampleName>` : ''}
   <Signal>
     <TraceId>${TRACE1}</TraceId>
     <DeviceName>SIMDEV</DeviceName>
@@ -155,7 +155,7 @@ function acmdInjection(N1, min1, max1, tEnd1, N2, tEnd2) {
 </Injection>`;
 }
 
-function rxInjectionACAML() {
+export function rxInjectionACAML() {
   return `<?xml version="1.0" encoding="utf-8"?>
 <ACAML xmlns="urn:schemas-agilent-com:acaml21" schemaversion="2.1.30.999">
  <Doc>
