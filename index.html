@@ -198,8 +198,10 @@ function getFileSlice(zip, entry) {
   const nameLen = u16(dv, p + 26);
   const extraLen = u16(dv, p + 28);
   const dataStart = p + 30 + nameLen + extraLen;
-  // subarray (zero-copy view) not slice: the result may be handed to a Web
-  // Worker via structured clone, which copies the viewed bytes exactly once.
+  // subarray (zero-copy view): ideal for the serial path, which reads it
+  // in-process. The worker path additionally .slice()s the view into a standalone
+  // buffer (see buildWorkerMessage) — cloning a view into this ~1 GB buffer would
+  // otherwise clone the whole backing buffer per postMessage.
   const comp = u8.subarray(dataStart, dataStart + entry.cSize);
   return comp;
 }
@@ -1190,7 +1192,10 @@ function buildWorkerMessage(outer, group, fileName) {
     const oe = outer.files.get(e.name);
     entries[e.within] = {
       method: oe.method, cSize: oe.cSize, uSize: oe.uSize, crc: oe.crc,
-      _raw: getFileSlice(outer, oe),
+      // .slice() → standalone ArrayBuffer: postMessage of a subarray VIEW would
+      // clone the whole ~1 GB backing buffer per message; a standalone copy clones
+      // only these cSize bytes.
+      _raw: getFileSlice(outer, oe).slice(),
     };
   }
   return { folderName: group.folderName, resultSet: group.folderName, sourceFile: fileName, entries };
@@ -1209,51 +1214,70 @@ async function parseContainerParallel(arrayBuffer, fileName, onProgress) {
     groups.length >= 8;
   if (!canParallel) return parseContainer(arrayBuffer, fileName);
 
-  let work;
+  // Lightweight group descriptors (folderName + entry {name,within} only — no
+  // bytes copied yet). Messages are built lazily inside the pool so only one
+  // group's compressed entry bytes are materialised (.slice()) at a time.
+  let descriptors;
   if (groups.length) {
-    work = groups.map(g => buildWorkerMessage(outer, g, fileName));
+    descriptors = groups;
     logln(`Container "${fileName}": ${groups.length} result set(s) — parallel.`);
   } else {
     const dxAny = [...outer.files.keys()].some(n => n.toLowerCase().endsWith(".dx"));
     if (!dxAny) throw new Error(`No .rslt folders and no .dx found inside "${fileName}".`);
-    const entries = {};
-    for (const [name, e] of outer.files) {
-      entries[name] = { method: e.method, cSize: e.cSize, uSize: e.uSize, crc: e.crc, _raw: getFileSlice(outer, e) };
-    }
-    work = [{ folderName: fileName, resultSet: fileName, sourceFile: fileName, entries }];
+    descriptors = [{ folderName: fileName, entries: [...outer.files.keys()].map(name => ({ name, within: name })) }];
     logln(`Container "${fileName}": no .rslt folders — one result set.`);
   }
 
   const ncpu = Math.max(1, Math.min((navigator && navigator.hardwareConcurrency) || 4, 8));
-  const chunkSize = Math.max(1, Math.ceil(work.length / ncpu));
-  const chunks = [];
-  for (let i = 0; i < work.length; i += chunkSize) chunks.push(work.slice(i, i + chunkSize));
+  const poolSize = Math.min(ncpu, descriptors.length);
 
   const xmldomText = document.getElementById("xmldom-src").textContent;
   const src = buildWorkerSource(xmldomText);
   const blobUrl = URL.createObjectURL(new Blob([src], { type: "text/javascript" }));
 
-  let done = 0;
-  try {
-    await Promise.all(chunks.map((chunk, i) => new Promise((resolve, reject) => {
-      const w = new Worker(blobUrl);
+  // Worker POOL: spawn `poolSize` workers ONCE and feed each one result set at a
+  // time. Two memory reasons force one-group-per-message: (1) a subarray VIEW
+  // into the ~1 GB backing buffer would clone the WHOLE buffer per postMessage, so
+  // buildWorkerMessage .slice()s each entry into a standalone buffer first; (2)
+  // building every group's message up-front would materialise ~1 GB of slices at
+  // once. Lazy per-group build keeps only `poolSize` small messages in flight.
+  const pool = [];
+  for (let i = 0; i < poolSize; i++) pool.push(new Worker(blobUrl));
+
+  let cursor = 0, done = 0;
+  const total = descriptors.length;
+  const feedOne = (w) => new Promise((resolve) => {
+    const step = () => {
+      if (cursor >= total) { w.terminate(); resolve(); return; }
+      const idx = cursor++;
       let settled = false;
       w.onmessage = (e) => {
+        if (settled) return;
+        settled = true;
         const d = e.data;
-        if (d && d.type === "done") {
-          for (const f of d.files) store.files.push(f);
-          done += chunk.length;
-          if (onProgress) try { onProgress(done, work.length); } catch (_) {}
-          settled = true; w.terminate(); resolve();
-        } else if (d && d.type === "error") {
-          if (!settled) { settled = true; w.terminate(); reject(new Error(d.message)); }
-        }
+        if (d && d.type === "done") for (const f of (d.files || [])) store.files.push(f);
+        done++;
+        if (onProgress) try { onProgress(done, total); } catch (_) {}
+        step();
       };
       w.onerror = (err) => {
-        if (!settled) { settled = true; w.terminate(); reject(new Error((err && err.message) || "Worker failed")); }
+        if (settled) return;
+        settled = true;
+      logln(`worker error on "${descriptors[idx].folderName}": ${(err && err.message) || err}`);
+        done++;
+        if (onProgress) try { onProgress(done, total); } catch (_) {}
+        step();
       };
-      w.postMessage({ type: "process", chunkIndex: i, groups: chunk });
-    })));
+      // Build this group's message ON DEMAND so only its compressed entry bytes are
+      // materialised (.slice() → standalone ArrayBuffer) at a time, not all groups'.
+      const msg = buildWorkerMessage(outer, descriptors[idx], fileName);
+      w.postMessage({ type: "process", chunkIndex: idx, groups: [msg] });
+    };
+    step();
+  });
+
+  try {
+    await Promise.all(pool.map(feedOne));
   } finally {
     URL.revokeObjectURL(blobUrl);
   }

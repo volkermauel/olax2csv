@@ -56,6 +56,35 @@ function buildMessages(buffer, fileName) {
   return groups.map((g) => app.buildWorkerMessage(outer, g, fileName));
 }
 
+// Replicate the browser's worker-POOL dispatch: spawn `poolSize` workers ONCE and
+// feed them one group at a time (each worker reused for many groups). This is the
+// exact shape of parseContainerParallel after the OOM fix, and it stresses the
+// worker's state reset between sequential single-group messages on one worker.
+async function runWorkerPool(messages, poolSize) {
+  const pool = Array.from({ length: poolSize }, () =>
+    new Worker(NODE_ADAPTER + workerSrc, { eval: true }));
+  const out = [];
+  let cursor = 0;
+  const feedOne = (w) => new Promise((resolve, reject) => {
+    const step = () => {
+      if (cursor >= messages.length) { w.terminate(); resolve(); return; }
+      const idx = cursor++;
+      w.removeAllListeners();
+      w.once('message', (m) => {
+        if (m && m.type === 'done') for (const f of (m.files || [])) out.push(f);
+        step();
+      });
+      w.once('error', (e) => { w.terminate(); reject(e); });
+      w.postMessage({ type: 'process', chunkIndex: idx, groups: [messages[idx]] });
+    };
+    step();
+  });
+  await Promise.all(pool.map(feedOne));
+  return out;
+}
+
+const byType = (a, b) => (a.instrumentType || '').localeCompare(b.instrumentType || '');
+
 // Comparable summary of one parsed file object (traces + result rows).
 function fileSummary(f) {
   const iRT = PEAK.indexOf('Retention time (min)');
@@ -146,6 +175,23 @@ test('parallel map-reduce (one worker per group) aggregates to the same result a
     (a.instrumentType || '').localeCompare(b.instrumentType || ''));
   assert.deepEqual(clone(aggregated), clone(ref));
   assert.equal(aggregated.length, 2);
+});
+
+test('worker POOL reuses workers for many one-at-a-time groups (matches serial)', async () => {
+  const { buffer } = buildResultsZip();
+  const messages = buildMessages(buffer, 'cm.zip');
+  const ref = clone((await serialSummaries(buffer, 'cm.zip')).sort(byType));
+
+  // Two reused workers, fed one group at a time (the browser pool shape after the
+  // OOM fix: small per-message clones instead of one big chunk).
+  const pool2 = clone((await runWorkerPool(messages, 2)).map(fileSummary).sort(byType));
+  assert.deepEqual(pool2, ref);
+
+  // One worker handling BOTH groups sequentially — this is the regression the pool
+  // introduces versus one-worker-per-group: it breaks if the worker fails to reset
+  // `store` between single-group messages.
+  const pool1 = clone((await runWorkerPool(messages, 1)).map(fileSummary).sort(byType));
+  assert.deepEqual(pool1, ref);
 });
 
 test('worker handles the OPC (.olax, %5c separator) single-result-set fixture', async () => {
