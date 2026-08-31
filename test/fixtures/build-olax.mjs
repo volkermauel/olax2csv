@@ -443,7 +443,11 @@ ${r.rx ? `          <ExternalResultPath>${r.rx}</ExternalResultPath>\n` : ''}   
 <ACAML xmlns="urn:schemas-agilent-com:acaml21" schemaversion="2.1.30.999">
 <Checksum Algorithm="MD5"><Value>placeholder==</Value></Checksum>
  <Doc>
+  <DocID>3f2504e0-4f89-11d3-9a0c-0305e82c3301</DocID>
   <DocInfo>
+   <Description>Fixture result set</Description>
+   <CreatedByUser>tester (LAB\tester)</CreatedByUser>
+   <CreationDate>2026-07-10T07:00:00.0000000Z</CreationDate>
    <CustomField Name="CreatedByUserDisplayName"><TypedValue>tester</TypedValue></CustomField>
    <CustomField Name="InjectionMetaDataItems">
     <Xml>

@@ -1335,7 +1335,7 @@ function acamlCanonicalDoc(xmlText) {
 // computeCommitRecords), then recompute the ACAML MD5 checksum. Returns the
 // original bytes when nothing changed or when the checksum is not MD5 (only
 // MD5 is verifiable by this replica).
-function repairAcamlManifest(bytes, withinMap, recs) {
+function repairAcamlManifest(bytes, withinMap, recs, opts) {
   const hadBom = bytes.length > 2 && bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf;
   let text = new TextDecoder().decode(bytes);
   let changed = false;
@@ -1343,9 +1343,15 @@ function repairAcamlManifest(bytes, withinMap, recs) {
     if (text.includes(from)) { text = text.split(from).join(to); changed = true; }
   }
   const commit = recs && recs.length;
-  if (!changed && !commit) return bytes;
+  // Fresh document identity (diagnostic variant): <DocID> is the identity a
+  // document backend keys on. Swapping it must happen before the checksum
+  // is recomputed, so the checksum covers the new identity.
+  const freshId = opts && opts.freshDocId && /<DocID>/.test(text);
+  if (!changed && !commit && !freshId) return bytes;
   if (/<Checksum Algorithm="(?!MD5)/.test(text)) return bytes; // e.g. SHA1: cannot re-derive
   if (commit) text = commitInjectionRecords(text, recs);
+  if (freshId)
+    text = text.replace(/(<DocID>)[^<]*(<\/DocID>)/, "$1" + newGuid() + "$2");
   const canonical = acamlCanonicalDoc(text);
   if (canonical != null) {
     text = text.replace(/(<Checksum Algorithm="MD5">\s*<Value>)[^<]*(<\/Value>)/,
@@ -1738,7 +1744,13 @@ function resultGroups(outer) {
 //    committed (see computeCommitRecords), MD5 checksum recomputed.
 //  - .mfx: paths retargeted, .acaml MD5 Identifier kept in step, File
 //    entries added for shipped .dx files the manifest never registered.
-async function buildRepairedOlax(arrayBuffer, containerName) {
+async function buildRepairedOlax(arrayBuffer, containerName, variant = "") {
+
+  // Diagnostic variants (URL ?variant=..., temporary) for import bisection:
+  //   nocommit  – repairs files/checksums but adds no manifest rows
+  //   origacaml – ships the manifest byte-identically, everything else on
+  //   freshid   – full repair, plus a newly minted identity (<DocID>)
+  // The default is the production behavior.
   const outer = parseZip(new Uint8Array(arrayBuffer));
   const plan = computeContainerRepairPlan(outer);
   const dropSet = new Set(plan.drop);
@@ -1778,12 +1790,17 @@ async function buildRepairedOlax(arrayBuffer, containerName) {
       .map(e => ({ ...e, within: withinOf(e.finalName) }));
 
     // Commit records for .dx files the .acaml never committed.
-    const recs = await computeCommitRecords(outer, entries, withinMap);
+    // 'nocommit' isolates the commit feature; 'origacaml' ships the manifest
+    // byte-identically; 'freshid' mints a new identity under the same rules.
+    const recs = variant === "nocommit"
+      ? [] : await computeCommitRecords(outer, entries, withinMap);
     const acamlE = entries.find(e => /\.acaml$/i.test(e.finalName));
-    const acamlFinal = acamlE && (withinMap.length || recs.length) ? {
+    const acamlFinal = variant !== "origacaml" && acamlE &&
+      (withinMap.length || recs.length || variant === "freshid") ? {
       name: acamlE.within,
       data: repairAcamlManifest(
-        await readZipFile(outer, acamlE.name), withinMap, recs)
+        await readZipFile(outer, acamlE.name), withinMap, recs,
+        { freshDocId: variant === "freshid" })
     } : null;
     if (recs.length)
       logln(`  ${g.folderName || stem}: committing ${recs.length} acquired-but-` +
@@ -1829,29 +1846,58 @@ async function buildRepairedOlax(arrayBuffer, containerName) {
         if (!keep.has(finalTarget)) return "";
         return tag.replace('Target="' + m[1] + '"', 'Target="/' + finalTarget + '"');
       });
+      files.push({ name: "_rels/.rels", data: encodeUTF8(rels) });
     } else {
+      // Synthesized wrapper: mirror native archives, which carry a package
+      // core-properties (psmdcp) part — category "Agilent OpenLab Archive
+      // File", the result set title, and when the manifest tells us, the
+      // original creator and creation date. The part name is deterministic
+      // (md5 of the result set name, mirroring the native GUID-hex naming).
+      const acamlText = (() => {
+        const f = files.find(x => /\.acaml$/i.test(x.name));
+        return f ? new TextDecoder().decode(f.data) : "";
+      })();
+      const creator = /<CreatedByUser>([^<]*)<\/CreatedByUser>/.exec(acamlText);
+      const created = /<CreationDate>([^<]*)<\/CreationDate>/.exec(acamlText);
+      const title = g.folderName || stem + ".rslt";
+      const coreName = "package/services/metadata/core-properties/" +
+        md5Hex(encodeUTF8(title)) + ".psmdcp";
+      const coreProps =
+        "\ufeff<?xml version=\"1.0\" encoding=\"utf-8\"?>" +
+        "<coreProperties xmlns:dc=\"http://purl.org/dc/elements/1.1/\" " +
+        "xmlns:dcterms=\"http://purl.org/dc/terms/\" " +
+        "xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" " +
+        "xmlns=\"http://schemas.openxmlformats.org/package/2006/metadata/core-properties\">" +
+        "<category>Agilent OpenLab Archive File</category>" +
+        (creator ? `<dc:creator>${xmlEscVal(xmlUnesc(creator[1]))}</dc:creator>` : "") +
+        (created ? `<dcterms:created xsi:type=\"dcterms:W3CDTF\">${created[1]}</dcterms:created>` : "") +
+        `<dc:title>${xmlEscVal(title)}</dc:title>` +
+        "<version>1.1</version></coreProperties>";
+      // Data-part relationships first, core-properties last (native order).
       rels = "\ufeff<?xml version=\"1.0\" encoding=\"utf-8\"?>" +
         "<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">" +
-        files.map((f, i) => `<Relationship Type="${REL_TYPE}" Target="/${f.name}" Id="R${(i + 1).toString(16).padStart(16, "0")}"/>`).join("") +
+        files.map((f, i) => `<Relationship Type=\"${REL_TYPE}\" Target=\"/${f.name}\" Id=\"R${(i + 1).toString(16).padStart(16, "0")}\"/>`).join("") +
+        `<Relationship Type=\"http://schemas.openxmlformats.org/package/2006/relationships/metadata/core-properties\" Target=\"/${coreName}\" Id=\"R${(files.length + 1).toString(16).padStart(16, "0")}\"/>` +
         "</Relationships>";
-    }
-    files.push({ name: "_rels/.rels", data: encodeUTF8(rels) });
-
-    if (hasWrapper) {
-      for (const w of wrapperFiles) files.push(w);
-    } else {
-      const exts = new Set(files.map(f => f.name.split(".").pop().toLowerCase()));
+      files.push({ name: coreName, data: encodeUTF8(coreProps) });
+      files.push({ name: "_rels/.rels", data: encodeUTF8(rels) });
+      const exts = new Set(files
+        .map(f => f.name.split(".").pop().toLowerCase())
+        .filter(ext => ext !== "rels" && ext !== "psmdcp"));
       let ct = "\ufeff<?xml version=\"1.0\" encoding=\"utf-8\"?>" +
         "<Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\">" +
-        "<Default Extension=\"rels\" ContentType=\"application/vnd.openxmlformats-package.relationships+xml\"/>";
-      for (const ext of exts) if (ext !== "rels")
-        ct += `<Default Extension="${ext}" ContentType="Agilent.OpenLab.Archive/ArchiveFile"/>`;
+        "<Default Extension=\"rels\" ContentType=\"application/vnd.openxmlformats-package.relationships+xml\"/>" +
+        "<Default Extension=\"psmdcp\" ContentType=\"application/vnd.openxmlformats-package.core-properties+xml\"/>";
+      for (const ext of exts)
+        ct += `<Default Extension=\"${ext}\" ContentType=\"Agilent.OpenLab.Archive/ArchiveFile\"/>`;
       files.push({ name: "[Content_Types].xml", data: encodeUTF8(ct + "</Types>") });
     }
+    if (hasWrapper) for (const w of wrapperFiles) files.push(w);
+    const tag = variant ? "-" + variant : "";
     outputs.push({
       name: groups.length === 1
-        ? stem + ".repaired.olax"
-        : sanitizeName((g.folderName || stem).replace(/\.rslt$/i, "")) + ".olax",
+        ? stem + ".repaired" + tag + ".olax"
+        : sanitizeName((g.folderName || stem).replace(/\.rslt$/i, "")) + tag + ".olax",
       blob: zipStore(files),
     });
   }
@@ -1873,7 +1919,8 @@ async function downloadRepaired() {
     if (!todo.length) return;
     const items = [];
     for (const c of todo) {
-      const outs = await buildRepairedOlax(await c.file.arrayBuffer(), c.name);
+      const outs = await buildRepairedOlax(
+        await c.file.arrayBuffer(), c.name, REPAIR_VARIANT);
       for (const o of outs) items.push({ name: o.name, blob: o.blob });
     }
     if (items.length === 1) {
@@ -2419,6 +2466,10 @@ logln("Ready.");
 // UTC build time). With the raw placeholders (local file, tests) the badge
 // stays hidden.
 const BUILD = { commit: "__COMMIT__", built: "__BUILT__" };
+// Temporary import-bisection switch: ?variant=nocommit|origacaml|freshid.
+const REPAIR_VARIANT =
+  typeof location !== "undefined" &&
+    new URLSearchParams(location.search).get("variant") || "";
 (function renderBuildInfo() {
   const el = typeof document !== "undefined" && document.getElementById("buildInfo");
   if (!el || !/^[0-9a-f]{7,40}$/.test(BUILD.commit)) return;

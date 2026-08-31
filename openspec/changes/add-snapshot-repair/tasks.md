@@ -98,3 +98,19 @@
        appVersion property on every entry), repaired archive re-parsed by
        the app lists every committed measurement (the 7-vs-22 regression),
        and non-manifest parts ship byte-identically. 63/63 green.
+- [x] 26. Native archive parity: repaired packages now synthesize the OPC
+       core-properties part (`package/services/metadata/core-properties/
+       <md5>.psmdcp`, category "Agilent OpenLab Archive File", title from
+       the result set, creator/created from the manifest DocInfo) plus the
+       trailing core-properties relationship and the psmdcp content-type
+       default — the one structural delta left against native .olax
+       exports. Verified with native `System.IO.Packaging.Package.Open`:
+       Title/Category/Creator/Created read exactly like a native archive.
+- [x] 27. Import-bisection variants (temporary, `?variant=` on the page,
+       filename-tagged): `nocommit` (everything but manifest rows),
+       `origacaml` (manifest byte-identical), `freshid` (full repair with
+       a freshly minted `<DocID>`, checksum recomputed over the new
+       identity). Agilent `AcamlChecksum.VerifyStream = True` on all four
+       artifacts built from the real RAD input; `System.IO.Packaging`
+       opens all four; fileset identifiers track the shipped bytes in
+       every variant. 67/67 green.

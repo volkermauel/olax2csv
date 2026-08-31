@@ -34,8 +34,8 @@ function containerOf(name) {
   return c;
 }
 
-async function repairedU8(fx, name) {
-  const outs = await app.buildRepairedOlax(fx.buffer, name);
+async function repairedU8(fx, name, variant) {
+  const outs = await app.buildRepairedOlax(fx.buffer, name, variant);
   assert.equal(outs.length, 1, 'single result set -> exactly one .olax');
   assert.ok(/\.olax$/i.test(outs[0].name), 'output is an .olax: ' + outs[0].name);
   return blobToU8(outs[0].blob);
@@ -597,7 +597,8 @@ test('repaired olax (commit repair): fileset mirrors the shipped parts',
   }
   const dataParts = [...z.files.keys()].filter(n =>
     !n.endsWith('/') && !/\.mfx$/i.test(n) &&
-    !['[Content_Types].xml', '_rels/.rels'].includes(n));
+    !['[Content_Types].xml', '_rels/.rels'].includes(n) &&
+    !n.startsWith('package/')); // wrapper-class, like the parser's isWrapper
   assert.equal(seen.size, dataParts.length,
     'one entry per shipped data part (acaml, dx, rx)');
   for (const p of dataParts) {
@@ -646,4 +647,105 @@ test('repaired olax carries non-manifest parts byte-identically', async () => {
       app.md5Hex(await app.readZipFile(zin, n)),
       'bytes unchanged for ' + n);
   }
+});
+
+test('repaired wrapper carries native-shaped package core properties', async () => {
+  // Native .olax exports ship a psmdcp core-properties part (category,
+  // title, creator, created) plus a matching core-properties relationship
+  // and content-type default. Repaired archives that synthesize the OPC
+  // wrapper must mirror that shape.
+  const fx = buildCommitOlax();
+  reset();
+  await app.parseOlax(fx.buffer, 'commit.olax');
+  const u8 = await repairedU8(fx, 'commit.olax');
+  const z = app.parseZip(u8);
+  const core = [...z.files.keys()].find(n =>
+    /^package\/services\/metadata\/core-properties\/[0-9a-f]{32}\.psmdcp$/.test(n));
+  assert.ok(core, 'psmdcp part present with deterministic hex name');
+  const ct = new TextDecoder().decode(await app.readZipFile(z, '[Content_Types].xml'));
+  assert.match(ct, /Extension="psmdcp"/,
+    'psmdcp content type declared');
+  assert.match(ct, /application\/vnd\.openxmlformats-package\.core-properties\+xml/,
+    'psmdcp gets the OPC core-properties content type');
+  const rels = new TextDecoder().decode(await app.readZipFile(z, '_rels/.rels'));
+  assert.ok(rels.includes('"/' + core + '"'),
+    'core-properties relationship targets the part');
+  const order = [...rels.matchAll(/Target="([^"]*)"/g)].map(m => m[1]);
+  assert.equal(order[order.length - 1], '/' + core,
+    'core-properties relationship comes last (native order)');
+  const coreXml = new TextDecoder().decode(await app.readZipFile(z, core));
+  assert.match(coreXml, /<category>Agilent OpenLab Archive File<\/category>/);
+  assert.match(coreXml, /<dc:title>[^<]*\.rslt<\/dc:title>/);
+  assert.match(coreXml, /<dc:creator>/, 'creator from the manifest DocInfo');
+  assert.match(coreXml, /<dcterms:created xsi:type="dcterms:W3CDTF">/,
+    'creation date from the manifest DocInfo');
+});
+
+test('variant nocommit: manifest keeps its original injection list', async () => {
+  // Diagnostic variant for import bisection: everything repairs (renames,
+  // checksums, fileset) but no <MeasData> rows are appended, so the
+  // manifest lists exactly the injections the input committed.
+  const fx = buildCommitOlax();
+  const zin = app.parseZip(new Uint8Array(fx.buffer));
+  const inAcaml = [...zin.files.keys()].find(n => /\.acaml$/i.test(n));
+  const before = (new TextDecoder().decode(await app.readZipFile(zin, inAcaml))
+    .match(/<MeasData /g) || []).length;
+  reset();
+  await app.parseOlax(fx.buffer, 'commit.olax');
+  const outs = await app.buildRepairedOlax(fx.buffer, 'commit.olax', 'nocommit');
+  assert.match(outs[0].name, /commit\.repaired-nocommit\.olax$/,
+    'variant is visible in the download name');
+  const z = app.parseZip(await blobToU8(outs[0].blob));
+  const outAcaml = [...z.files.keys()].find(n => /\.acaml$/i.test(n));
+  const after = (new TextDecoder().decode(await app.readZipFile(z, outAcaml))
+    .match(/<MeasData /g) || []).length;
+  assert.equal(after, before, 'no MeasData rows added');
+});
+
+test('variant origacaml: manifest ships byte-identically', async () => {
+  const fx = buildCommitOlax();
+  const zin = app.parseZip(new Uint8Array(fx.buffer));
+  const inAcaml = [...zin.files.keys()].find(n => /\.acaml$/i.test(n));
+  const inBytes = await app.readZipFile(zin, inAcaml);
+  reset();
+  await app.parseOlax(fx.buffer, 'commit.olax');
+  const outs = await app.buildRepairedOlax(fx.buffer, 'commit.olax', 'origacaml');
+  const z = app.parseZip(await blobToU8(outs[0].blob));
+  const outAcaml = [...z.files.keys()].find(n => /\.acaml$/i.test(n));
+  assert.equal(app.md5Hex(await app.readZipFile(z, outAcaml)),
+    app.md5Hex(inBytes), 'acaml untouched');
+});
+
+test('variant freshid: new DocID under a valid checksum', async () => {
+  // The <DocID> is the document identity a document backend keys on.
+  // freshid must swap it BEFORE the checksum is recomputed, so the
+  // checksum covers the new identity and the fileset identifier tracks
+  // the new bytes.
+  const fx = buildCommitOlax();
+  const zin = app.parseZip(new Uint8Array(fx.buffer));
+  const inAcaml = [...zin.files.keys()].find(n => /\.acaml$/i.test(n));
+  const inDocId = /<DocID>([^<]*)<\/DocID>/.exec(
+    new TextDecoder().decode(await app.readZipFile(zin, inAcaml)))[1];
+  reset();
+  await app.parseOlax(fx.buffer, 'commit.olax');
+  const outs = await app.buildRepairedOlax(fx.buffer, 'commit.olax', 'freshid');
+  const z = app.parseZip(await blobToU8(outs[0].blob));
+  const outAcaml = [...z.files.keys()].find(n => /\.acaml$/i.test(n));
+  const text = new TextDecoder().decode(await app.readZipFile(z, outAcaml));
+  const outDocId = /<DocID>([^<]*)<\/DocID>/.exec(text)[1];
+  assert.notEqual(outDocId, inDocId, 'identity is fresh');
+  assert.match(outDocId, /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/,
+    'identity stays a GUID');
+  const canonical = app.acamlCanonicalDoc(text);
+  assert.ok(canonical != null, 'document canonicalizes');
+  assert.equal(/<Value>([^<]*)<\/Value>/.exec(text)[1],
+    app.md5Base64(app.encodeUTF8(canonical)),
+    'checksum covers the new identity');
+  const mfxName = [...z.files.keys()].find(n => /\.mfx$/i.test(n));
+  const mfx = new TextDecoder().decode(await app.readZipFile(z, mfxName));
+  const acamlEntry = /\.acaml"/.exec(mfx);
+  assert.ok(acamlEntry, 'fileset tracks the acaml');
+  assert.ok(mfx.includes('Identifier="' +
+    app.md5Hex(await app.readZipFile(z, outAcaml)) + '"'),
+    'fileset acaml identifier = MD5 of the shipped bytes');
 });
