@@ -321,3 +321,96 @@ test('repaired olax from OPC input: wrapper carried over, .rels rewritten, names
   assert.equal(app.allResults().peaks.length, 1);
   void c;
 });
+
+/* ---------------- ACAML manifest repair (.acaml/.mfx + MD5 checksum) --------- */
+
+// Reference vector for the checksum algorithm: canonical re-serialization of
+// the <Doc> subtree (UTF-8, no declaration, no inter-element whitespace,
+// CDATA preserved, newlines raw in text / entitized in attributes), then MD5.
+test('acaml checksum: reference vector (CDATA, entities, multi-line text)', async () => {
+  const vec = `<?xml version="1.0" encoding="utf-8"?>
+<ACAML xmlns:xsd="http://www.w3.org/2001/XMLSchema" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" schemaversion="2.1.30.999" xmlns="urn:schemas-agilent-com:acaml21">
+  <Checksum Algorithm="MD5">
+    <Value>E4J7Oyth3ym0hQsyaVJNAw==</Value>
+  </Checksum>
+  <Doc>
+    <DocID>synthetic-vector</DocID>
+    <DocInfo>
+      <Description>A &amp; B &lt;test&gt; with &gt; chars</Description>
+      <MultiLine>line1
+line2
+line3</MultiLine>
+    </DocInfo>
+    <Injections>
+      <InjectionMetaData xmlns:xsd="http://www.w3.org/2001/XMLSchema" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns="">
+        <Path><![CDATA[snapshot-20260828 215532-280826-18F-01 2026-08-28 21-24-55+02-00-r005.dx]]></Path>
+        <TypedValue xsi:type="xsd:string">x</TypedValue>
+      </InjectionMetaData>
+    </Injections>
+    <Empty />
+    <Paired></Paired>
+  </Doc>
+</ACAML>`;
+  const got = app.md5Base64(app.encodeUTF8(app.acamlCanonicalDoc(vec)));
+  assert.equal(got, 'E4J7Oyth3ym0hQsyaVJNAw==');
+});
+
+test('repairAcamlManifest: rewrites snapshot paths, recomputes checksum, keeps BOM', async () => {
+  const mk = (bom, value) => {
+    const body = `<ACAML xmlns="urn:schemas-agilent-com:acaml21" schemaversion="2.1.30.999">
+<Checksum Algorithm="MD5"><Value>${value}</Value></Checksum>
+ <Doc><Content><Injections>
+  <InjectionMetaData><Path>snapshot-20260710 084732-Run_Test.dx</Path></InjectionMetaData>
+ </Injections></Content></Doc>
+</ACAML>`;
+    return app.encodeUTF8(bom ? '\ufeff' + body : body);
+  };
+  const map = new Map([['snapshot-20260710 084732-Run_Test.dx', 'Run_Test.dx']]);
+
+  const out = app.repairAcamlManifest(mk(true, 'placeholder=='), map);
+  const text = new TextDecoder().decode(out);
+  assert.ok(out[0] === 0xef && out[1] === 0xbb && out[2] === 0xbf, 'BOM preserved');
+  assert.ok(!text.includes('snapshot-'), 'snapshot path retargeted');
+  const m = /<Value>([^<]*)<\/Value>/.exec(text);
+  assert.equal(m[1], app.md5Base64(app.encodeUTF8(app.acamlCanonicalDoc(text))), 'checksum matches recomputed canonical MD5');
+
+  // unchanged input (no snapshot refs) -> original bytes
+  const plain = mk(false, 'x');
+  assert.equal(app.repairAcamlManifest(plain, new Map()), plain, 'no-op returns original bytes');
+});
+
+test('repairAcamlManifest: non-MD5 checksum left untouched', async () => {
+  const body = app.encodeUTF8(`<ACAML xmlns="urn:schemas-agilent-com:acaml21"><Checksum Algorithm="SHA1"><Value>aa==</Value></Checksum>
+ <Doc><Path>snapshot-20260710 084732-Run_Test.dx</Path></Doc></ACAML>`);
+  const out = app.repairAcamlManifest(body, new Map([['snapshot-20260710 084732-Run_Test.dx', 'Run_Test.dx']]));
+  assert.equal(out, body, 'unverifiable algorithm -> original bytes');
+});
+
+test('repaired olax: manifest snapshot refs retargeted with valid checksum (duplicate mode)', async () => {
+  const fx = buildOlax({ snapshot: 'duplicate', withRx: true });
+  reset();
+  await app.parseOlax(fx.buffer, 'dup.olax');
+  const outs = await app.buildRepairedOlax(fx.buffer, 'dup.olax');
+  const zip = app.parseZip(blobToU8(outs[0].blob));
+  const acamlName = [...zip.files.keys()].find((n) => /\.acaml$/i.test(n));
+  const text = new TextDecoder().decode(await app.readZipFile(zip, acamlName));
+
+  assert.ok(!/Path>[^<]*snapshot-/i.test(text), 'no snapshot Path refs left');
+  assert.ok(text.includes('<Path>Run_Test.dx</Path>'), 'regular ref present');
+  const m = /<Value>([^<]*)<\/Value>/.exec(text);
+  assert.notEqual(m[1], 'placeholder==', 'checksum was recomputed');
+  assert.equal(m[1], app.md5Base64(app.encodeUTF8(app.acamlCanonicalDoc(text))), 'checksum self-consistent');
+});
+
+test('repaired olax: snapshot-only manifest promoted (only mode)', async () => {
+  const fx = buildOlax({ snapshot: 'only', withRx: true });
+  reset();
+  await app.parseOlax(fx.buffer, 'only.olax');
+  const outs = await app.buildRepairedOlax(fx.buffer, 'only.olax');
+  const zip = app.parseZip(blobToU8(outs[0].blob));
+  const acamlName = [...zip.files.keys()].find((n) => /\.acaml$/i.test(n));
+  const text = new TextDecoder().decode(await app.readZipFile(zip, acamlName));
+
+  assert.ok(!/Path>[^<]*snapshot-/i.test(text), 'promoted: snapshot ref renamed to regular');
+  assert.ok(text.includes('<Path>Run_Test.dx</Path>'));
+});

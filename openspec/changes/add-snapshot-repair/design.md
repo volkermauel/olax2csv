@@ -72,9 +72,15 @@ original encoded part names verbatim.
   checksum, so this is safe.
 - `[Content_Types].xml` is extension-based -> renames cannot invalidate it;
   carried over verbatim or synthesized.
-- `.acaml`/`.mfx`: byte-identical. Their MD5 `<Checksum>` preimage is an
-  unknown canonicalization (dual-sample experiment found no match), so edits
-  risk OpenLab rejecting the manifest. Consequence: RAD-style manifest
-  `<Path>`s that name `snapshot-…-r005.dx` dangle after repair — accepted,
-  because the tool's parser never reads the manifest and data extraction is
-  name-driven.
+- `.acaml`/`.mfx`: snapshot `<Path>` references are retargeted to the regular
+  names (promoted and dropped snapshots alike). The `.acaml` MD5 `<Checksum>`
+  is then recomputed: the preimage is the `<Doc>` subtree re-serialized
+  canonically (UTF-8 without BOM/declaration, inter-element whitespace
+  dropped, CDATA preserved, newlines raw in text / entitized in attribute
+  values). The algorithm reproduces every stored checksum checked so far
+  (two real-world manifests plus a synthetic reference vector) and Agilent's
+  own calculator validates the recomputed checksum of a repaired archive.
+  Manifests with a non-MD5 checksum are left byte-identical (unverifiable).
+  `.mfx` carries no checksum and is rewritten freely. Application-build
+  metadata like `appVersion="SNAPSHOT-2026-…"` is version metadata, not a
+  file reference, and is never touched.

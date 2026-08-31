@@ -1160,10 +1160,13 @@ async function parseOlax(arrayBuffer, fileName, opts) { return parseContainer(ar
    to <name> (promoted), and partial snapshot duplicates of completed runs are
    dropped — the result set then natively includes all acquired measurements. */
 
+// Segment-anchored snapshot prefix (shared by the repair plan and the manifest
+// rewrite): the prefix must start a path segment — raw OPC names use "%5c" as
+// separator, Content-Manager zips use "/".
+const SNAPSHOT_SEG = /(^|[\/\\]|%5c)snapshot-\d{8}[ +]\d{6}-/i;
+
 function computeContainerRepairPlan(outer) {
-  // Segment-anchored: the prefix must start a path segment — raw OPC names use
-  // "%5c" as separator, Content-Manager zips use "/".
-  const segSnap = /(^|[\/\\]|%5c)snapshot-\d{8}[ +]\d{6}-/i;
+  const segSnap = SNAPSHOT_SEG;
   const names = [...outer.files.keys()];
   const promote = [], drop = [];
   const snaps = [];
@@ -1178,6 +1181,161 @@ function computeContainerRepairPlan(outer) {
     else promote.push({ from: n, to });                  // acquired but never committed → promote
   }
   return { promote, drop };
+}
+
+/* ---- ACAML <Doc> checksum (MD5) ----------------------------------------------
+   The <Checksum Algorithm="MD5"><Value>…</Value></Checksum> in every .acaml
+   is the MD5 over the <Doc> subtree, re-serialized with UTF-8 (no BOM), no
+   XML declaration, no inter-element whitespace, and newline entitizing
+   (\r -> &#xD;, \n -> &#xA; in text and attribute values). */
+function md5Base64(bytes) {
+  const S = [7, 12, 17, 22, 5, 9, 14, 20, 4, 11, 16, 23, 6, 10, 15, 21];
+  const K = new Int32Array(64);
+  for (let i = 0; i < 64; i++) K[i] = Math.floor(Math.abs(Math.sin(i + 1)) * 4294967296);
+  const rotl = (x, c) => (x << c) | (x >>> (32 - c));
+  let a0 = 0x67452301, b0 = 0xefcdab89, c0 = 0x98badcfe, d0 = 0x10325476;
+  const len = bytes.length;
+  const padded = new Uint8Array((((len + 8) >> 6) + 1) << 6);
+  padded.set(bytes); padded[len] = 0x80;
+  const dv = new DataView(padded.buffer);
+  dv.setUint32(padded.length - 8, len << 3, true);
+  dv.setUint32(padded.length - 4, Math.floor(len / 0x20000000), true);
+  for (let off = 0; off < padded.length; off += 64) {
+    let A = a0, B = b0, C = c0, D = d0;
+    for (let i = 0; i < 64; i++) {
+      let F, g;
+      if (i < 16)      { F = (B & C) | (~B & D); g = i; }
+      else if (i < 32) { F = (D & B) | (~D & C); g = (5 * i + 1) % 16; }
+      else if (i < 48) { F = B ^ C ^ D;          g = (3 * i + 5) % 16; }
+      else             { F = C ^ (B | ~D);      g = (7 * i) % 16; }
+      F = (F + A + K[i] + dv.getUint32(off + g * 4, true)) | 0;
+      A = D; D = C; C = B;
+      B = (B + rotl(F, S[(i >> 4) * 4 + (i % 4)])) | 0;
+    }
+    a0 = (a0 + A) | 0; b0 = (b0 + B) | 0; c0 = (c0 + C) | 0; d0 = (d0 + D) | 0;
+  }
+  const out = new Uint8Array(16), odv = new DataView(out.buffer);
+  odv.setInt32(0, a0, true); odv.setInt32(4, b0, true); odv.setInt32(8, c0, true); odv.setInt32(12, d0, true);
+  let bin = "";
+  for (let i = 0; i < 16; i++) bin += String.fromCharCode(out[i]);
+  // inline base64 (btoa is not available in every host this code runs in)
+  const B64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  let b64 = "";
+  for (let i = 0; i < 15; i += 3)
+    b64 += B64[bin.charCodeAt(i) >> 2] + B64[((bin.charCodeAt(i) & 3) << 4) | (bin.charCodeAt(i + 1) >> 4)] +
+      B64[((bin.charCodeAt(i + 1) & 15) << 2) | (bin.charCodeAt(i + 2) >> 6)] + B64[bin.charCodeAt(i + 2) & 63];
+  b64 += B64[bin.charCodeAt(15) >> 2] + B64[(bin.charCodeAt(15) & 3) << 4] + "==";   // 16th digest byte
+  return b64;
+}
+
+function acamlCanonicalDoc(xmlText) {
+  const doc = new DOMParser().parseFromString(xmlText, "text/xml");
+  const findDoc = (n) => {
+    if (n.nodeType === 1 && n.localName === "Doc") return n;
+    const kids = n.childNodes || [];
+    for (let i = 0; i < kids.length; i++) { const r = findDoc(kids[i]); if (r) return r; }
+    return null;
+  };
+  const docEl = findDoc(doc);
+  if (!docEl) return null;
+
+  // .NET keeps paired-empty (<X></X>, <X>\n</X>) distinct from <X />; the DOM
+  // cannot express that — recover it from the raw text. Agilent-written ACAML
+  // is always self-closed; this only matters for hand-edited files.
+  const pairedEmpty = new Set();
+  const pairedRe = /<([A-Za-z_][\w.:-]*(?::[A-Za-z_][\w.:-]*)?)(\s[^>]*)?>\s*<\/\1>/g;
+  let pm;
+  while ((pm = pairedRe.exec(xmlText))) pairedEmpty.add(pm[1]);
+
+  // text nodes: only & < > are escaped — NewLineHandling.Entitize does NOT
+  // entitize newlines in text nodes (only in attribute values), verified
+  // against OpenLab's own checksum computation.
+  const escText = (s) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  const escAttr = (s) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;").replace(/\r/g, "&#xD;").replace(/\n/g, "&#xA;").replace(/\t/g, "&#x9;");
+  const attrsOf = (el) => {
+    const m = el.attributes, out = [];
+    if (m) for (let i = 0; i < m.length; i++) out.push(m.item ? m.item(i) : m[i]);
+    return out;
+  };
+  const qname = (n) => n.prefix ? n.prefix + ":" + n.localName : n.localName;
+  const isXmlns = (a) => a.name === "xmlns" || a.prefix === "xmlns";
+
+  let out = "";
+  const stack = [{}];   // writer-side prefix bindings (fresh document: empty)
+
+  function writeElement(el) {
+    const outer = stack[stack.length - 1];
+    const ownMap = {}, forced = {}, pairedDecls = {};
+    for (const a of attrsOf(el)) if (isXmlns(a)) ownMap[a.prefix ? a.localName : ""] = a.value;
+    const effective = { ...outer, ...ownMap };
+    const elPrefix = el.prefix || "";
+    const elUri = el.namespaceURI || "";
+    let attrStr = "";
+    if (!(elPrefix in effective) && elUri) {   // WriteStartElement forced declaration
+      attrStr += elPrefix ? ` xmlns:${elPrefix}="${escAttr(elUri)}"` : ` xmlns="${escAttr(elUri)}"`;
+      forced[elPrefix] = elUri;
+    }
+    for (const a of attrsOf(el)) {
+      if (isXmlns(a)) { attrStr += ` ${a.name}="${escAttr(a.value)}"`; continue; }
+      const p = a.prefix || "";
+      if (p && !(p in effective) && !(p in pairedDecls)) {
+        attrStr += ` xmlns:${p}="${escAttr(a.namespaceURI || "")}"`;
+        pairedDecls[p] = 1;
+      }
+      attrStr += ` ${a.name}="${escAttr(a.value)}"`;
+    }
+    const kids = el.childNodes || [];
+    let hasContent = false;
+    for (let i = 0; i < kids.length; i++) {
+      const k = kids[i];
+      if (k.nodeType !== 3 || (k.nodeValue || "").trim()) { hasContent = true; break; }
+    }
+    const q = qname(el);
+    if (!hasContent) { out += pairedEmpty.has(q) ? `<${q}${attrStr}></${q}>` : `<${q}${attrStr} />`; return; }
+    out += `<${q}${attrStr}>`;
+    stack.push({ ...outer, ...forced, ...ownMap, ...pairedDecls });
+    for (let i = 0; i < kids.length; i++) writeNode(kids[i]);
+    stack.pop();
+    out += `</${q}>`;
+  }
+
+  function writeNode(n) {
+    switch (n.nodeType) {
+      case 1: writeElement(n); break;
+      case 3: if ((n.nodeValue || "").trim()) out += escText(n.nodeValue); break; // whitespace dropped
+      case 4: out += `<![CDATA[${n.nodeValue}]]>`; break;
+      case 8: out += `<!--${n.nodeValue}-->`; break;
+      case 7: out += `<?${n.target} ${n.data}?>`; break;
+    }
+  }
+
+  writeElement(docEl);
+  return out;
+}
+
+// Rewrite snapshot references (promoted AND dropped ones — their regular
+// counterpart ships either way) to the regular names inside .acaml/.mfx
+// manifests, then recompute the ACAML MD5 checksum. Returns the original
+// bytes when nothing changed or when the checksum is not MD5 (only MD5 is
+// verifiable by this replica).
+function repairAcamlManifest(bytes, withinMap) {
+  const hadBom = bytes.length > 2 && bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf;
+  let text = new TextDecoder().decode(bytes);
+  let changed = false;
+  for (const [from, to] of withinMap) {
+    if (text.includes(from)) { text = text.split(from).join(to); changed = true; }
+  }
+  if (!changed) return bytes;
+  if (/<Checksum Algorithm="(?!MD5)/.test(text)) return bytes; // e.g. SHA1: cannot re-derive
+  const canonical = acamlCanonicalDoc(text);
+  if (canonical != null) {
+    text = text.replace(/(<Checksum Algorithm="MD5">\s*<Value>)[^<]*(<\/Value>)/,
+      "$1" + md5Base64(encodeUTF8(canonical)) + "$2");
+  }
+  return hadBom
+    ? new Uint8Array([0xef, 0xbb, 0xbf, ...encodeUTF8(text)])
+    : encodeUTF8(text);
 }
 
 function recordContainer(outer, fileName, opts) {
@@ -1239,14 +1397,29 @@ async function buildRepairedOlax(arrayBuffer, containerName) {
   const outputs = [];
   for (const g of groups) {
     const files = [];
+    // Manifest-level rename map (within-name level): every snapshot entry maps
+    // to its regular counterpart — promoted files are renamed, dropped ones
+    // leave the regular file shipped, so retargeting is always resolvable.
+    const withinOf = (full) => g.key && full.startsWith(g.key + "/") ? full.slice(g.key.length + 1) : full;
+    const withinMap = [
+      ...plan.promote.map(p => [withinOf(p.from), withinOf(p.to)]),
+      ...plan.drop.map(n => [n, n.replace(SNAPSHOT_SEG, "$1")]).map(([f, t]) => [withinOf(f), withinOf(t)]),
+    ];
     for (const e of g.entries) {
       if (dropSet.has(e.name)) continue;
       const finalName = promoteMap.get(e.name) || e.name;
       const opc = hasWrapper ? finalName
         : g.folderName ? g.key + "%5c" + finalName.slice(g.key.length + 1).replace(/\//g, "%5c")
         : stem + ".rslt%5c" + finalName.replace(/\//g, "%5c");
-      files.push({ name: opc, data: await readZipFile(outer, e.name) });
+      const data = await readZipFile(outer, e.name);
+      files.push({
+        name: opc,
+        data: /\.(acaml|mfx)$/i.test(e.name) && withinMap.length
+          ? repairAcamlManifest(data, withinMap)
+          : data,
+      });
     }
+    if (!files.length) continue;
     if (!files.length) continue;
 
     // _rels/.rels must list exactly the parts we ship (plus the wrapper).

@@ -45,11 +45,12 @@ acquired measurements:
   `_rels/.rels` is rewritten to reference exactly the shipped parts (dropped
   targets removed, promoted targets renamed) and `[Content_Types].xml` is
   carried over verbatim or synthesized; zip CRC32 is recomputed for every
-  written entry. The `.acaml`/`.mfx` manifests SHALL stay byte-identical —
-  their `<Checksum Algorithm="MD5">` cannot be re-derived (verified
-  experimentally), so editing them risks manifest rejection; a known
-  consequence is that manifest `<Path>` entries still naming snapshot files
-  dangle in the repaired archive (the parser never reads the manifest).
+  written entry. In the `.acaml`/`.mfx` manifests, `<Path>` references to
+  snapshot files SHALL be retargeted to the regular file names (promoted and
+  dropped snapshots alike — the regular counterpart ships either way) and the
+  `.acaml` MD5 `<Checksum>` SHALL be recomputed over the canonical
+  re-serialization of the edited `<Doc>` subtree. When the stored checksum
+  algorithm is not MD5, the manifest SHALL be left byte-identical.
 
 ### RS-4: Results extraction
 

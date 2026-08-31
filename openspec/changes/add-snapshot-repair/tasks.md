@@ -35,9 +35,17 @@
 - [x] 16. Package consistency: `_rels/.rels` rewritten to match shipped parts
        exactly (dropped targets removed, promoted renamed, synthesized for CM
        zips); `[Content_Types].xml` carried over or synthesized; zip CRC32
-       recomputed. `.acaml`/`.mfx` stay byte-identical (MD5 checksum not
-       re-derivable — documented as accepted dangling-ref limitation).
+       recomputed.
+- [x] 18. ACAML checksum: derived the MD5 `<Checksum>` algorithm (canonical
+       re-serialization of `<Doc>`) and replicated it in the app; validated
+       against two real-world manifests and one synthetic reference vector,
+       plus Agilent's own calculator on a repaired archive.
+- [x] 19. Manifest repair: `.acaml`/`.mfx` snapshot `<Path>` refs retargeted
+       to regular names with the checksum recomputed; non-MD5 manifests left
+       byte-identical; `appVersion="SNAPSHOT-…"` build metadata untouched.
 - [x] 17. Verified on real data: RAD `.rslt.zip` -> 35.6 MB
        `.repaired.olax` (7 injections, re-parse with repair OFF, all CRCs OK,
-       0 dangling rels targets, acaml byte-identical); berlin `.olax` ->
-       identical results (10 injections / 72 peaks), 3 snapshot rels removed.
+       0 dangling rels targets); berlin `.olax` -> identical results (10
+       injections / 72 peaks), 3 snapshot rels removed. After task 19: RAD
+       acaml fully retargeted (0 snapshot `<Path>`s) with the recomputed
+       checksum validated by Agilent's own calculator.

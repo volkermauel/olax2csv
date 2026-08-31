@@ -112,12 +112,17 @@ export const CALIBRATION = {
 
 /* ---------- XML builders ---------- */
 
-export function acamlRegistry() {
+export function acamlRegistry(paths = ['Run_Test.dx']) {
+  const inj = paths.map(p => `  <InjectionMetaData><Path>${p}</Path></InjectionMetaData>`).join('\n');
   return `<?xml version="1.0" encoding="utf-8"?>
 <ACAML xmlns="urn:schemas-agilent-com:acaml21" schemaversion="2.1.30.999">
+<Checksum Algorithm="MD5"><Value>placeholder==</Value></Checksum>
  <Doc><Content><Resources>
   <Signal id="${SIG1}"><Name>SIM1</Name><ChannelName>A</ChannelName><Description>SIM1,Simulated detector 1</Description></Signal>
- </Resources></Content></Doc>
+ </Resources>
+ <Injections>
+${inj}
+ </Injections></Content></Doc>
 </ACAML>`;
 }
 
@@ -305,15 +310,20 @@ export function buildOlax({ withRx = true, snapshot = 'none', opc = false } = {}
     olaxEntries.length = 0; // drop the regular run; keep only the manifest
     olaxEntries.push(
       { name: snapDxName, data: dxZip },
-      { name: 'Run.acaml', data: enc(acamlRegistry()) },
+      { name: 'Run.acaml', data: enc(acamlRegistry([snapDxName])) },
       { name: snapRxName, data: rxZip },
     );
   } else if (snapshot === 'duplicate') {
     if (withRx) olaxEntries.push({ name: dxName.replace(/\.dx$/, '.rx'), data: rxZip });
     olaxEntries.push({ name: snapDxName, data: dxZip });
     olaxEntries.push({ name: snapRxName, data: rxZip });
+    // Manifest written while both existed — references regular AND snapshot names.
+    const reg = olaxEntries.find(e => e.name === 'Run.acaml');
+    reg.data = enc(acamlRegistry([dxName, snapDxName]));
   } else if (snapshot === 'rxOnly') {
     olaxEntries.push({ name: snapRxName, data: rxZip });
+    const reg = olaxEntries.find(e => e.name === 'Run.acaml');
+    reg.data = enc(acamlRegistry([dxName, snapRxName]));
   } else if (withRx) {
     olaxEntries.push({ name: dxName.replace(/\.dx$/, '.rx'), data: rxZip });
   }
