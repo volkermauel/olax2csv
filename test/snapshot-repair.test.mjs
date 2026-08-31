@@ -35,9 +35,21 @@ function containerOf(name) {
 }
 
 async function repairedU8(fx, name) {
-  const c = containerOf(name);
-  const blob = await app.buildRepairedContainer(fx.buffer, c.plan);
-  return blobToU8(blob);
+  const outs = await app.buildRepairedOlax(fx.buffer, name);
+  assert.equal(outs.length, 1, 'single result set -> exactly one .olax');
+  assert.ok(/\.olax$/i.test(outs[0].name), 'output is an .olax: ' + outs[0].name);
+  return blobToU8(outs[0].blob);
+}
+
+async function relsTargets(u8) {
+  const z = app.parseZip(u8);
+  const rels = new TextDecoder().decode(await app.readZipFile(z, '_rels/.rels'));
+  return [...rels.matchAll(/Target="([^"]*)"/g)].map(m => m[1]);
+}
+
+async function contentTypes(u8) {
+  const z = app.parseZip(u8);
+  return new TextDecoder().decode(await app.readZipFile(z, '[Content_Types].xml'));
 }
 
 test('repair ON (default): snapshot-only measurement is recovered with traces and results', async () => {
@@ -162,28 +174,38 @@ test('plan: OPC "%5c" and CM "/" separators, "+" and space ts forms', () => {
 
 /* ---------------- repaired container round-trips ---------------- */
 
-test('repaired container: snapshot-only run becomes a native regular run', async () => {
+test('repaired olax: snapshot-only run becomes a native regular run', async () => {
   reset();
   await app.parseOlax(fxOnly.buffer, 'snap-only.olax');
   const u8 = await repairedU8(fxOnly, 'snap-only.olax');
   const names = [...app.parseZip(u8).files.keys()].sort();
-  assert.ok(names.includes('Run_Test.dx'));
-  assert.ok(names.includes('Run_Test.rx'));
+  assert.ok(names.includes('snap-only.rslt%5cRun_Test.dx'), 'promoted dx: ' + names.join(' | '));
+  assert.ok(names.includes('snap-only.rslt%5cRun_Test.rx'), 'promoted rx');
   assert.ok(!names.some((n) => n.toLowerCase().includes('snapshot-')), 'no snapshot- names remain');
+
+  // OPC wrapper: parts + consistent relationships
+  assert.ok(names.includes('[Content_Types].xml') && names.includes('_rels/.rels'), 'OPC wrapper present');
+  const targets = await relsTargets(u8);
+  assert.ok(targets.includes('/snap-only.rslt%5cRun_Test.dx'), 'rels references promoted dx');
+  assert.ok(targets.includes('/snap-only.rslt%5cRun_Test.rx'), 'rels references promoted rx');
+  assert.ok(!targets.some((t) => /snapshot-/i.test(t)), 'no snapshot- rels targets');
+  assert.ok(/Extension="acaml"/.test(await contentTypes(u8)), 'content types cover acaml');
 
   reset();
   await app.parseOlax(u8.buffer, 'repaired.olax', { repairSnapshots: false });
-  assert.equal(app.allTraces().length, 2, 'repaired container parses natively (repair OFF)');
+  assert.equal(app.allTraces().length, 2, 'repaired olax parses natively (repair OFF)');
   assert.equal(app.allResults().peaks.length, 1);
 });
 
-test('repaired container: partial snapshot duplicates are removed', async () => {
+test('repaired olax: partial snapshot duplicates are removed', async () => {
   reset();
   await app.parseOlax(fxDup.buffer, 'snap-dup.olax');
   const u8 = await repairedU8(fxDup, 'snap-dup.olax');
   const names = [...app.parseZip(u8).files.keys()];
-  assert.ok(names.includes('Run_Test.dx'));
+  assert.ok(names.includes('snap-dup.rslt%5cRun_Test.dx'));
   assert.ok(!names.some((n) => n.toLowerCase().includes('snapshot-')));
+  const targets = await relsTargets(u8);
+  assert.ok(!targets.some((t) => /snapshot-/i.test(t)), 'dropped parts leave no rels target');
 
   reset();
   await app.parseOlax(u8.buffer, 'repaired.olax', { repairSnapshots: false });
@@ -191,12 +213,15 @@ test('repaired container: partial snapshot duplicates are removed', async () => 
   assert.equal(app.allResults().peaks.length, 1);
 });
 
-test('repaired container: snapshot .rx is promoted next to the regular .dx', async () => {
+test('repaired olax: snapshot .rx is promoted next to the regular .dx', async () => {
   reset();
   await app.parseOlax(fxRxOnly.buffer, 'snap-rx.olax');
   const u8 = await repairedU8(fxRxOnly, 'snap-rx.olax');
   const names = [...app.parseZip(u8).files.keys()].sort();
-  assert.deepEqual(names.filter((n) => /run_test\.(dx|rx)$/i.test(n)), ['Run_Test.dx', 'Run_Test.rx']);
+  assert.deepEqual(names.filter((n) => /run_test\.(dx|rx)$/i.test(n)),
+    ['snap-rx.rslt%5cRun_Test.dx', 'snap-rx.rslt%5cRun_Test.rx']);
+  const targets = await relsTargets(u8);
+  assert.ok(targets.includes('/snap-rx.rslt%5cRun_Test.rx'), 'rels references promoted rx');
 
   reset();
   await app.parseOlax(u8.buffer, 'repaired.olax', { repairSnapshots: false });
@@ -233,11 +258,66 @@ test('CM zip: grouped .rslt with a snapshot-only result set round-trips', async 
   const c = containerOf('cm.zip');
   assert.equal(c.olax, false);
   assert.equal(c.plan.promote.map((p) => p.to).sort().join('|'), 'BROKEN.rslt/Run.dx|BROKEN.rslt/Run.rx');
-  const u8 = blobToU8(await app.buildRepairedContainer(buf.buffer, c.plan));
+
+  // CM zip -> TWO .olax archives (one per result set), both named after their folder
+  const outs = await app.buildRepairedOlax(buf.buffer, 'cm.zip');
+  assert.equal(outs.map(o => o.name).sort().join('|'), 'BROKEN.olax|OK.olax');
+  assert.ok(outs.every(o => /\.olax$/i.test(o.name)), 'always .olax, even for .zip input');
+
+  let traces = 0, peaks = 0, files = 0;
+  for (const o of outs) {
+    const u8 = blobToU8(o.blob);
+    const names = [...app.parseZip(u8).files.keys()];
+    assert.ok(!names.some((n) => /snapshot-/i.test(n)), o.name + ': no snapshot- names');
+    assert.ok(names.some((n) => /\.rslt%5crun\.(dx|rx)$/i.test(n)), o.name + ': %5c-encoded .rslt parts');
+    const targets = await relsTargets(u8);
+    assert.ok(!targets.some((t) => /snapshot-/i.test(t)), o.name + ': no snapshot- rels targets');
+    reset();
+    await app.parseOlax(u8.buffer, o.name, { repairSnapshots: false });
+    files += app.store.files.length;
+    traces += app.allTraces().length;
+    peaks += app.allResults().peaks.length;
+  }
+  assert.equal(files, 2);
+  assert.equal(traces, 4, 'repaired olax files parse natively (repair OFF)');
+  assert.equal(peaks, 2);
+});
+
+/* ---------------- OPC wrapper maintenance (.olax in -> .olax out) ---------------- */
+
+test('repaired olax from OPC input: wrapper carried over, .rels rewritten, names verbatim', async () => {
+  const fxOpc = buildOlax({ snapshot: 'duplicate', opc: true });
+  reset();
+  await app.parseOlax(fxOpc.buffer, 'opc-dup.olax');
+  const c = containerOf('opc-dup.olax');
+
+  const outs = await app.buildRepairedOlax(fxOpc.buffer, 'opc-dup.olax');
+  assert.equal(outs.length, 1);
+  assert.equal(outs[0].name, 'opc-dup.repaired.olax');
+  const u8 = blobToU8(outs[0].blob);
+  const names = [...app.parseZip(u8).files.keys()].sort();
+
+  // original part names kept VERBATIM (real OPC encoding, not re-synthesized)
+  assert.ok(names.includes('Run_Test.dx'), 'verbatim OPC part name');
+  assert.ok(names.includes('Run_Test.rx'));
+  assert.ok(!names.some((n) => /snapshot-/i.test(n)));
+
+  // [Content_Types].xml byte-identical; .rels rewritten
+  const ct = await contentTypes(u8);
+  const origZip = app.parseZip(new Uint8Array(fxOpc.buffer));
+  const origCt = new TextDecoder().decode(await app.readZipFile(origZip, '[Content_Types].xml'));
+  assert.equal(ct, origCt, '[Content_Types].xml carried over byte-identical');
+
+  const targets = await relsTargets(u8);
+  // 3 targets = dx, rx, acaml. [Content_Types].xml is the content-types
+  // stream, not a part, so it correctly has no relationship (same as real .olax).
+  assert.equal(targets.length, 3, 'rels: one target per shipped part');
+  assert.ok(targets.includes('/Run_Test.dx') && targets.includes('/Run_Test.rx') && targets.includes('/Run.acaml'));
+  assert.ok(!targets.some((t) => /snapshot-/i.test(t)), 'dropped snapshot parts removed from rels');
 
   reset();
-  await app.parseOlax(u8.buffer, 'repaired-cm.zip', { repairSnapshots: false });
-  assert.equal(app.store.files.length, 2);
-  assert.equal(app.allTraces().length, 4, 'repaired CM zip parses natively (repair OFF)');
-  assert.equal(app.allResults().peaks.length, 2);
+  await app.parseOlax(u8.buffer, 'repaired.olax', { repairSnapshots: false });
+  assert.equal(app.allTraces().length, 2);
+  assert.equal(app.allResults().peaks.length, 1);
+  void c;
 });

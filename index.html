@@ -46,7 +46,7 @@
       <button id="zipBtn" class="primary" disabled>Download traces as ZIP (CSV)</button>
       <button id="zipAllBtn" disabled>Download ALL traces as ZIP</button>
       <button id="xlsxBtn" class="primary" disabled>Download results as Excel (.xlsx)</button>
-      <button id="repairedBtn" disabled title="Download a copy of the container with snapshot repairs applied: measurements acquired under an unclosed snapshot session are renamed to their regular file names; partial snapshot duplicates of completed runs are removed.">Download repaired container(s)</button>
+      <button id="repairedBtn" disabled title="Download repaired .olax archive(s): measurements acquired under an unclosed snapshot session are renamed to their regular file names, partial snapshot duplicates of completed runs are removed, and the OPC package parts (_rels/.rels, [Content_Types].xml) are kept consistent. One .olax per result set — also for .zip inputs.">Download repaired .olax</button>
     </div>
     <div style="margin-top:10px" class="mono">
       <b>Raw traces → CSV</b>: columns <b>time_ms, time_s, time_min, value</b>, one <b>.dx</b> per measurement.<br/>
@@ -1190,18 +1190,104 @@ function recordContainer(outer, fileName, opts) {
   });
 }
 
-// Rebuild a container with the repair plan applied. Returns a stored-zip Blob;
-// entry order and untouched entry names are preserved.
-async function buildRepairedContainer(arrayBuffer, plan) {
+// Build repaired .olax archive(s) from a container. An .olax holds exactly ONE
+// result set, so a Content-Manager .zip with N .rslt folders yields N .olax
+// files (kept only when repairs exist). Snapshot promotions are renamed,
+// partial duplicates dropped; every other entry is byte-identical.
+//
+// Checksum/consistency policy:
+//  - zip CRC32: recomputed for every entry we write (zipStore), inner .dx/.rx
+//    zips are carried byte-exact, so all CRCs stay valid.
+//  - _rels/.rels: references EVERY part (snapshots included) — rewritten so it
+//    matches the repaired part list exactly (removed targets deleted, promoted
+//    targets renamed); synthesized when the input is a bare CM .zip.
+//  - [Content_Types].xml: extension-based, renames cannot invalidate it;
+//    carried over verbatim from OPC inputs, synthesized for CM .zip inputs.
+//  - .acaml/.mfx manifests: deliberately byte-identical. Their <Checksum
+//    Algorithm="MD5"> covers an unknown canonicalization (verified: not a
+//    preimage of the file or any simple section), so editing them risks
+//    OpenLab rejecting the manifest. Our parser never reads the manifest.
+async function buildRepairedOlax(arrayBuffer, containerName) {
   const outer = parseZip(new Uint8Array(arrayBuffer));
+  const plan = computeContainerRepairPlan(outer);
   const dropSet = new Set(plan.drop);
   const promoteMap = new Map(plan.promote.map(p => [p.from, p.to]));
-  const files = [];
-  for (const [name] of outer.files) {
-    if (dropSet.has(name)) continue;
-    files.push({ name: promoteMap.get(name) || name, data: await readZipFile(outer, name) });
+  const hasWrapper = outer.files.has("[Content_Types].xml");
+  const stem = sanitizeName((containerName || "resultset").replace(/\.(olax|zip)$/i, "").replace(/\.rslt$/i, ""));
+  const REL_TYPE = "urn:schemas-agilent-com:OpenLabArchive";
+
+  let groups = [...groupByRslt(outer).values()];
+  if (!groups.length) {
+    // Back-compat flat container (no .rslt folder): whole zip = one result set.
+    // OPC wrapper parts are never result-set content.
+    const isWrapper = n => n === "[Content_Types].xml" || n === "_rels/.rels" ||
+      /^_rels\//.test(n) || /^package\//.test(n);
+    groups = [{ key: "", folderName: null,
+      entries: [...outer.files.keys()].filter(n => !isWrapper(n)).map(n => ({ within: n, name: n })) }];
   }
-  return zipStore(files);
+
+  // Wrapper parts to carry over verbatim when the input already is an OPC package.
+  const inGroup = new Set(groups.flatMap(g => g.entries.map(e => e.name)));
+  const wrapperFiles = [];
+  let origRels = null;
+  for (const [name] of outer.files) {
+    if (inGroup.has(name)) continue;
+    if (name === "_rels/.rels") { origRels = new TextDecoder().decode(await readZipFile(outer, name)); continue; }
+    wrapperFiles.push({ name, data: await readZipFile(outer, name) });
+  }
+
+  const outputs = [];
+  for (const g of groups) {
+    const files = [];
+    for (const e of g.entries) {
+      if (dropSet.has(e.name)) continue;
+      const finalName = promoteMap.get(e.name) || e.name;
+      const opc = hasWrapper ? finalName
+        : g.folderName ? g.key + "%5c" + finalName.slice(g.key.length + 1).replace(/\//g, "%5c")
+        : stem + ".rslt%5c" + finalName.replace(/\//g, "%5c");
+      files.push({ name: opc, data: await readZipFile(outer, e.name) });
+    }
+    if (!files.length) continue;
+
+    // _rels/.rels must list exactly the parts we ship (plus the wrapper).
+    const keep = new Set([...files.map(f => f.name), ...wrapperFiles.map(w => w.name)]);
+    let rels;
+    if (origRels != null) {
+      rels = origRels.replace(/<Relationship\b[^>]*?(?:\/>|><\/Relationship>)/g, tag => {
+        const m = tag.match(/Target="([^"]*)"/);
+        if (!m) return tag;
+        const target = m[1].replace(/^\//, "");
+        const finalTarget = promoteMap.get(target) || target;
+        if (!keep.has(finalTarget)) return "";
+        return tag.replace('Target="' + m[1] + '"', 'Target="/' + finalTarget + '"');
+      });
+    } else {
+      rels = "\ufeff<?xml version=\"1.0\" encoding=\"utf-8\"?>" +
+        "<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">" +
+        files.map((f, i) => `<Relationship Type="${REL_TYPE}" Target="/${f.name}" Id="R${(i + 1).toString(16).padStart(16, "0")}"/>`).join("") +
+        "</Relationships>";
+    }
+    files.push({ name: "_rels/.rels", data: encodeUTF8(rels) });
+
+    if (hasWrapper) {
+      for (const w of wrapperFiles) files.push(w);
+    } else {
+      const exts = new Set(files.map(f => f.name.split(".").pop().toLowerCase()));
+      let ct = "\ufeff<?xml version=\"1.0\" encoding=\"utf-8\"?>" +
+        "<Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\">" +
+        "<Default Extension=\"rels\" ContentType=\"application/vnd.openxmlformats-package.relationships+xml\"/>";
+      for (const ext of exts) if (ext !== "rels")
+        ct += `<Default Extension="${ext}" ContentType="Agilent.OpenLab.Archive/ArchiveFile"/>`;
+      files.push({ name: "[Content_Types].xml", data: encodeUTF8(ct + "</Types>") });
+    }
+    outputs.push({
+      name: groups.length === 1
+        ? stem + ".repaired.olax"
+        : sanitizeName((g.folderName || stem).replace(/\.rslt$/i, "")) + ".olax",
+      blob: zipStore(files),
+    });
+  }
+  return outputs;
 }
 
 async function downloadRepaired() {
@@ -1211,9 +1297,8 @@ async function downloadRepaired() {
     if (!todo.length) return;
     const items = [];
     for (const c of todo) {
-      const blob = await buildRepairedContainer(await c.file.arrayBuffer(), c.plan);
-      const stem = sanitizeName(c.name.replace(/\.(olax|zip)$/i, ""));
-      items.push({ name: stem + ".repaired." + (c.olax ? "olax" : "zip"), blob });
+      const outs = await buildRepairedOlax(await c.file.arrayBuffer(), c.name);
+      for (const o of outs) items.push({ name: o.name, blob: o.blob });
     }
     if (items.length === 1) {
       downloadBlob(items[0].blob, items[0].name);
@@ -1222,7 +1307,7 @@ async function downloadRepaired() {
         name: it.name,
         data: new Uint8Array(await it.blob.arrayBuffer()),
       }))));
-      downloadBlob(wrap, "repaired-containers.zip");
+      downloadBlob(wrap, "repaired-olax.zip");
     }
   } catch (e) {
     alert("Repaired download failed: " + e.message);

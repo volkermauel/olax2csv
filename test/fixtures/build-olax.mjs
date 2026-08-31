@@ -240,7 +240,7 @@ export function rxInjectionACAML() {
 
 /* ---------- public builder ---------- */
 
-export function buildOlax({ withRx = true, snapshot = 'none' } = {}) {
+export function buildOlax({ withRx = true, snapshot = 'none', opc = false } = {}) {
   // Trace 1: a clean Gaussian peak + small baseline (exercises bestFloatSegment)
   const N1 = 1000, tStart1 = 0, tEnd1 = 600000; // ms -> 10 min run
   const dt1 = (tEnd1 - tStart1) / N1;
@@ -316,6 +316,23 @@ export function buildOlax({ withRx = true, snapshot = 'none' } = {}) {
     olaxEntries.push({ name: snapRxName, data: rxZip });
   } else if (withRx) {
     olaxEntries.push({ name: dxName.replace(/\.dx$/, '.rx'), data: rxZip });
+  }
+
+  // opc: wrap like a real OpenLab .olax (OPC [Content_Types].xml + _rels/.rels
+  // referencing every part, snapshots included) so repairs must maintain them.
+  if (opc) {
+    const rels = '\ufeff<?xml version="1.0" encoding="utf-8"?>' +
+      '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">' +
+      olaxEntries.map((e, i) =>
+        `<Relationship Type="urn:schemas-agilent-com:OpenLabArchive" Target="/${e.name}" Id="R${(i + 1).toString(16).padStart(16, '0')}"/>`).join('') +
+      '</Relationships>';
+    const exts = new Set([...olaxEntries.map(e => e.name.split('.').pop().toLowerCase()), 'rels']);
+    const ct = '\ufeff<?xml version="1.0" encoding="utf-8"?>' +
+      '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">' +
+      [...exts].map(x => `<Default Extension="${x}" ContentType="${x === 'rels' ? 'application/vnd.openxmlformats-package.relationships+xml' : 'Agilent.OpenLab.Archive/ArchiveFile'}"/>`).join('') +
+      '</Types>';
+    olaxEntries.push({ name: '_rels/.rels', data: enc(rels) });
+    olaxEntries.push({ name: '[Content_Types].xml', data: enc(ct) });
   }
 
   return {

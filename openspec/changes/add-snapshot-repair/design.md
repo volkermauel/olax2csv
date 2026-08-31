@@ -53,3 +53,28 @@ one checkbox away.
 ## Open Questions
 
 None.
+
+## Decision: repaired download is always .olax (zip -> olax conversion)
+
+An .olax holds exactly ONE result set, so a CM .zip with N `.rslt` folders
+yields N `.olax` files (single group -> `<stem>.repaired.olax`; multi group ->
+`<resultset>.olax`, wrapped into one zip when more than one download). Folder
+paths are re-encoded to OPC part names (`/` -> `%5c`); OPC inputs keep their
+original encoded part names verbatim.
+
+## Decision: checksum / package-consistency policy
+
+- zip CRC32: recomputed per written entry by `zipStore`; inner .dx/.rx zips
+  are carried byte-exact. Verified with Python `zipfile.testzip()` on the
+  repaired real-world archives.
+- `_rels/.rels` references EVERY part including snapshots -> rewritten (drop
+  removed, rename promoted; synthesized for bare CM zips). `.rels` carries no
+  checksum, so this is safe.
+- `[Content_Types].xml` is extension-based -> renames cannot invalidate it;
+  carried over verbatim or synthesized.
+- `.acaml`/`.mfx`: byte-identical. Their MD5 `<Checksum>` preimage is an
+  unknown canonicalization (dual-sample experiment found no match), so edits
+  risk OpenLab rejecting the manifest. Consequence: RAD-style manifest
+  `<Path>`s that name `snapshot-…-r005.dx` dangle after repair — accepted,
+  because the tool's parser never reads the manifest and data extraction is
+  name-driven.

@@ -34,11 +34,22 @@ acquired measurements:
 - RS-3.6: classification (`detectGroupMeta`) MAY fall back to a snapshot `.amx`
   when no regular method file exists;
 - RS-3.7: the option SHALL reach the Web Worker path via the worker message;
-- RS-3.8: the tool SHALL offer downloading a repaired copy of the container:
-  snapshot files whose counterpart is missing are renamed to their regular
-  names, partial snapshot duplicates are removed, all other entries are kept
-  byte-identical; the repaired container MUST parse natively with repair
-  disabled (the repair is baked in, not re-applied on read).
+- RS-3.8: the tool SHALL offer downloading repaired archives as .olax — one
+  per result set, also when the input was a Content-Manager .zip: snapshot
+  files whose counterpart is missing are renamed to their regular names,
+  partial snapshot duplicates are removed, all other entries are kept
+  byte-identical; a .zip result-set folder `X.rslt/a.dx` is re-encoded as the
+  OPC part `X.rslt%5ca.dx`. The repaired archive MUST parse natively with
+  repair disabled (the repair is baked in, not re-applied on read).
+- RS-3.9: the repaired .olax SHALL keep its OPC package consistent:
+  `_rels/.rels` is rewritten to reference exactly the shipped parts (dropped
+  targets removed, promoted targets renamed) and `[Content_Types].xml` is
+  carried over verbatim or synthesized; zip CRC32 is recomputed for every
+  written entry. The `.acaml`/`.mfx` manifests SHALL stay byte-identical —
+  their `<Checksum Algorithm="MD5">` cannot be re-derived (verified
+  experimentally), so editing them risks manifest rejection; a known
+  consequence is that manifest `<Path>` entries still naming snapshot files
+  dangle in the repaired archive (the parser never reads the manifest).
 
 ### RS-4: Results extraction
 

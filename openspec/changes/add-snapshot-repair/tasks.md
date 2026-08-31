@@ -29,3 +29,15 @@
        grouped CM `.rslt` round-trip. 48/48 green.
 - [x] 14. Real-file proof: RAD zip repairs to 7 injections (r005.rx promoted,
        3 partial snapshots dropped); Berlin `.olax` unchanged (10/10/72).
+- [x] 15. Repaired download ALWAYS emits .olax (one per result set; CM .zip
+       folder paths re-encoded `/` -> `%5c`; OPC inputs keep part names
+       verbatim; multi-output wrapped into one zip).
+- [x] 16. Package consistency: `_rels/.rels` rewritten to match shipped parts
+       exactly (dropped targets removed, promoted renamed, synthesized for CM
+       zips); `[Content_Types].xml` carried over or synthesized; zip CRC32
+       recomputed. `.acaml`/`.mfx` stay byte-identical (MD5 checksum not
+       re-derivable — documented as accepted dangling-ref limitation).
+- [x] 17. Verified on real data: RAD `.rslt.zip` -> 35.6 MB
+       `.repaired.olax` (7 injections, re-parse with repair OFF, all CRCs OK,
+       0 dangling rels targets, acaml byte-identical); berlin `.olax` ->
+       identical results (10 injections / 72 peaks), 3 snapshot rels removed.
