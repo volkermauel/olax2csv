@@ -9,5 +9,5 @@
 - [x] 3. Harness exposes `BUILD`; `test/build-stamp.test.mjs` locks the
        deploy contract (tokens exactly once, hidden anchor, placeholder not
        SHA-shaped). 58/58 green.
-- [ ] 4. Push, confirm the deploy job green, switch Pages build_type to
-       `workflow`, verify the live badge.
+- [x] 4. Push, confirm the deploy job green, switch Pages build_type to
+       `workflow`, verify the live badge. (Done: live page stamped `0e89b88 / 2026-08-31 15:08 UTC`.)
