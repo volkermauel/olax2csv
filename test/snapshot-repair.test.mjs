@@ -7,7 +7,7 @@
 import { test, before } from 'node:test';
 import assert from 'node:assert/strict';
 import { loadApp, blobToU8 } from './harness.mjs';
-import { buildOlax, makeZip, enc, acmdInjection, acamlRegistry, rxInjectionACAML, TRACE1, TRACE2 } from './fixtures/build-olax.mjs';
+import { buildOlax, makeZip, enc, filesetManifest, acmdInjection, acamlRegistry, rxInjectionACAML, TRACE1, TRACE2 } from './fixtures/build-olax.mjs';
 
 let app;
 let fxOnly;       // run exists ONLY as snapshot-…-Run_Test.dx/.rx
@@ -506,4 +506,65 @@ test('uncommitted-dx detection gates the repaired download', async () => {
   await app.parseOlax(fx.buffer, 'commit.olax');
   assert.equal(await app.olaxHasUncommittedDx(fx.buffer), true,
     'r002/r003 detected as uncommitted');
+});
+
+test('repaired olax: mfx fileset matches the shipped parts exactly (drop + promote)', async () => {
+  const fx = buildOlax({
+    snapshot: 'duplicate',
+    mfx: [
+      'Run.acaml',
+      'Run_Test.dx',
+      'snapshot-20260710 084732-Run_Test.dx',   // partial copy — regular ships
+      'snapshot-20260710 084732-Run_Test.rx',   // only copy of the results
+    ],
+  });
+  reset();
+  await app.parseOlax(fx.buffer, 'dup.olax');
+  const u8 = await repairedU8(fx, 'dup.olax');
+  const z = app.parseZip(u8);
+  const mfxName = [...z.files.keys()].find(n => /\.mfx$/i.test(n));
+  const mfx = new TextDecoder().decode(await app.readZipFile(z, mfxName));
+
+  // One entry per shipped data file, none left over: the snapshot-duplicate
+  // entries are gone (their runs ship as regular files), the snapshot .rx is
+  // listed under its promoted regular name.
+  assert.equal((mfx.match(/<File /g) || []).length, 3,
+    'acaml + dx + rx, exactly one entry each');
+  assert.equal(mfx.includes('snapshot-'), false, 'no snapshot paths remain');
+  for (const f of ['Run.acaml', 'Run_Test.dx', 'Run_Test.rx']) {
+    const e = new RegExp(`<File Path="${f}" IdentifierAlgorithm="MD5" Identifier="([0-9a-f]{32})"`).exec(mfx);
+    assert.ok(e, 'mfx lists ' + f);
+    const part = [...z.files.keys()].find(n => n.endsWith(f));
+    assert.equal(e[1], app.md5Hex(await app.readZipFile(z, part)),
+      'identifier = MD5 of shipped bytes for ' + f);
+  }
+});
+
+test('repaired olax: mfx with correct identifiers stays byte-identical', async () => {
+  // Healthy input whose mfx already matches the shipped bytes — the repair
+  // must not touch it (identifiers, formatting and BOM preserved).
+  const base = buildOlax({ withRx: true });
+  const z0 = app.parseZip(new Uint8Array(base.buffer));
+  const md5Of = async n => app.md5Hex(await app.readZipFile(z0, n));
+  const entries = [];
+  for (const [n] of z0.files) {
+    if (n.endsWith('/')) continue;
+    entries.push({ name: n, data: await app.readZipFile(z0, n) });
+  }
+  // filesetManifest() adds the Run.acaml entry itself.
+  const mfxBytes = enc(filesetManifest([
+    { path: 'Run_Test.dx', md5: await md5Of('Run_Test.dx') },
+    { path: 'Run_Test.rx', md5: await md5Of('Run_Test.rx') },
+  ]).replace(
+    /<File Path="Run.acaml" IdentifierAlgorithm="MD5" Identifier="0{32}"/,
+    `<File Path="Run.acaml" IdentifierAlgorithm="MD5" Identifier="${await md5Of('Run.acaml')}"`));
+  const fx = { buffer: makeZip([...entries, { name: 'Run.mfx', data: mfxBytes }]).buffer };
+  reset();
+  await app.parseOlax(fx.buffer, 'healthy-mfx.olax');
+  const u8 = await repairedU8(fx, 'healthy-mfx.olax');
+  const z = app.parseZip(u8);
+  const mfxName = [...z.files.keys()].find(n => /\.mfx$/i.test(n));
+  const out = await app.readZipFile(z, mfxName);
+  assert.equal(Buffer.compare(Buffer.from(out), Buffer.from(mfxBytes)), 0,
+    'mfx byte-identical when already consistent');
 });

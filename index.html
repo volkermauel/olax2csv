@@ -1580,42 +1580,95 @@ function commitInjectionRecords(text, recs) {
   return text;
 }
 
-// Fileset (.mfx) repair: snapshot-name retargeting plus keeping the Fileset
-// consistent with the repaired archive — the .acaml's MD5 Identifier
-// follows its repaired bytes, and shipped .dx files the abandoned session
-// never registered get File entries of their own.
-function repairMfxManifest(bytes, withinMap, ctx) {
+// Fileset (.mfx) repair: rebuild the <File> list so it describes exactly
+// the parts the repaired archive ships — one entry per data file with the
+// MD5 of the bytes actually written. Snapshot entries whose completed run
+// ships instead are removed (the regular entry already exists); a promoted
+// snapshot (the only copy of that run) is renamed to its regular name.
+// Unknown-file entries are dropped, missing ones appended. An mfx that
+// already matches the shipped bytes stays byte-identical.
+function repairMfxManifest(bytes, shipped) {
   const hadBom = bytes.length > 2 && bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf;
-  let text = new TextDecoder().decode(bytes);
-  let changed = false;
-  for (const [from, to] of withinMap)
-    if (text.includes(from)) { text = text.split(from).join(to); changed = true; }
-  if (ctx && ctx.acaml) {
-    const re = new RegExp('(<File Path="' + escapeRe(xmlEscVal(ctx.acaml.name)) +
-      '" IdentifierAlgorithm="MD5" Identifier=")[0-9a-fA-F]*(")');
-    if (re.test(text)) {
-      text = text.replace(re, "$1" + md5Hex(ctx.acaml.data) + "$2");
-      changed = true;
-    }
+  const text = new TextDecoder().decode(bytes);
+  const blockRe = /<File\b[^>]*?(?:\/>|>[\s\S]*?<\/File>)/g;
+  const blocks = text.match(blockRe);
+  if (!blocks) return bytes;
+
+  const baseOf = p => {
+    const i = Math.max(p.lastIndexOf("\\"), p.lastIndexOf("/"));
+    return i === -1 ? p : p.slice(i + 1);
+  };
+  const byKey = new Map();
+  for (const f of shipped) {
+    byKey.set(baseOf(f.name).toLowerCase(), f);
+    byKey.set(f.name.toLowerCase(), f);
   }
-  if (ctx && ctx.addFiles && ctx.addFiles.length) {
-    const listed = new Set([...text.matchAll(/<File Path="([^"]*)"/g)]
-      .map(f => xmlUnesc(f[1]).toLowerCase()));
-    const missing = ctx.addFiles.filter(f => !listed.has(f.name.toLowerCase()));
-    if (missing.length) {
-      const appVer = (/Property Name="appVersion" Value="(ACQ-[^"]*)"/.exec(text) || [])[1];
-      const prop = appVer ? "\n      <Property Name=\"appVersion\" Value=\"" + appVer + "\" />" : "";
-      const add = missing.map(f =>
-        "    <File Path=\"" + xmlEscVal(f.name) + "\" IdentifierAlgorithm=\"MD5\" " +
-        "Identifier=\"" + f.md5 + "\">" + prop + "\n    </File>").join("\n");
-      text = text.replace(/(\s*)<\/Files>/, "$1" + add + "$1</Files>");
-      changed = true;
+
+  // Resolve every entry to the shipped file it describes. Pass 1: direct
+  // (non-snapshot) names claim their file first, so a snapshot entry for a
+  // run whose regular file also ships resolves to nothing (dropped).
+  const winner = new Map(); // shipped name (lc) -> rewritten block
+  const pending = [];
+  const verbatim = new Set(); // block indexes we must not touch (non-MD5)
+  for (let i = 0; i < blocks.length; i++) {
+    const b = blocks[i];
+    const pm = b.match(/ Path="([^"]*)"/);
+    if (!pm || !/IdentifierAlgorithm="MD5"/.test(b)) { verbatim.add(i); continue; }
+    const f = byKey.get(baseOf(xmlUnesc(pm[1])).toLowerCase()) ||
+      byKey.get(xmlUnesc(pm[1]).toLowerCase()) || null;
+    if (!f) { pending.push({ b, i, f: null }); continue; }
+    if (!winner.has(f.name.toLowerCase())) winner.set(f.name.toLowerCase(), { i, b, f });
+  }
+  for (const { b, i } of pending) {
+    const pm = b.match(/ Path="([^"]*)"/);
+    if (!pm) continue;
+    const p = xmlUnesc(pm[1]);
+    if (!SNAPSHOT_SEG.test(p)) continue;
+    const f = byKey.get(baseOf(p.replace(SNAPSHOT_SEG, "$1")).toLowerCase());
+    if (f && !winner.has(f.name.toLowerCase())) winner.set(f.name.toLowerCase(), { i, b, f });
+  }
+
+  let changed = false;
+  const rewritten = blocks.map((b, idx) => {
+    if (verbatim.has(idx)) return b;
+    const pm = b.match(/ Path="([^"]*)"/);
+    let key;
+    if (pm) {
+      const p = xmlUnesc(pm[1]);
+      const f = byKey.get(baseOf(p).toLowerCase()) ||
+        byKey.get(p.toLowerCase()) ||
+        (SNAPSHOT_SEG.test(p) &&
+          byKey.get(baseOf(p.replace(SNAPSHOT_SEG, "$1")).toLowerCase()));
+      key = (f || {}).name;
     }
+    const w = pm && winner.get(key && key.toLowerCase());
+    if (!w || w.i !== idx) { changed = true; return ""; }
+    let nb = b
+      .replace(/ Path="[^"]*"/, " Path=\"" + xmlEscVal(w.f.name) + "\"");
+    nb = / Identifier="[^"]*"/.test(nb)
+      ? nb.replace(/ Identifier="[^"]*"/, " Identifier=\"" + w.f.md5 + "\"")
+      : nb.replace(/IdentifierAlgorithm="MD5"/,
+        "IdentifierAlgorithm=\"MD5\" Identifier=\"" + w.f.md5 + "\"");
+    if (nb !== b) changed = true;
+    return nb;
+  });
+
+  const covered = new Set([...winner.keys()]);
+  const missing = shipped.filter(f => !covered.has(f.name.toLowerCase()));
+  let out = text.replace(blockRe, () => rewritten.length ? rewritten.shift() : "");
+  if (missing.length) {
+    const appVer = (/Property Name="appVersion" Value="(ACQ-[^"]*)"/.exec(text) || [])[1];
+    const prop = appVer ? "\n      <Property Name=\"appVersion\" Value=\"" + appVer + "\" />" : "";
+    const add = missing.map(f =>
+      "    <File Path=\"" + xmlEscVal(f.name) + "\" IdentifierAlgorithm=\"MD5\" " +
+      "Identifier=\"" + f.md5 + "\">" + prop + "\n    </File>").join("\n");
+    out = out.replace(/(\s*)<\/Files>/, "$1" + add + "$1</Files>");
+    changed = true;
   }
   if (!changed) return bytes;
   return hadBom
-    ? new Uint8Array([0xef, 0xbb, 0xbf, ...encodeUTF8(text)])
-    : encodeUTF8(text);
+    ? new Uint8Array([0xef, 0xbb, 0xbf, ...encodeUTF8(out)])
+    : encodeUTF8(out);
 }
 
 // Quick check used by the download gate: does any group of this container
@@ -1750,16 +1803,16 @@ async function buildRepairedOlax(arrayBuffer, containerName) {
     }
     if (!files.length) continue;
 
-    if (mfxIdx >= 0 && (withinMap.length || acamlFinal)) {
-      const addFiles = [];
+    if (mfxIdx >= 0) {
+      // One entry per shipped data file, identifier = MD5 of the bytes we
+      // actually write (covers renamed/promoted files and the repaired
+      // .acaml alike). The mfx itself is not self-listed.
+      const shipped = [];
       entries.forEach((e, i) => {
-        if (!/\.dx$/i.test(e.finalName)) return;
-        addFiles.push({ name: e.within, md5: md5Hex(files[i].data) });
+        if (i === mfxIdx) return;
+        shipped.push({ name: e.within, md5: md5Hex(files[i].data) });
       });
-      const repaired = repairMfxManifest(mfxData, withinMap, {
-        acaml: acamlFinal,
-        addFiles
-      });
+      const repaired = repairMfxManifest(mfxData, shipped);
       if (repaired !== mfxData)
         files[mfxIdx] = { name: files[mfxIdx].name, data: repaired };
     }

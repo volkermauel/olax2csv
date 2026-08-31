@@ -63,10 +63,14 @@ acquired measurements:
   times are converted to the UTC millisecond form. No `ExternalResultPath`
   is written — the injection keeps its honest 'acquired, not yet
   processed' state until reprocessed in OpenLab. The MD5 checksum is
-  recomputed, and the `.mfx` fileset gains `<File>` entries (MD5 hex
-  digest of the shipped bytes) for every newly registered part, with the
-  `.acaml` entry updated to the repaired digest. When all injections are
-  already committed the manifest SHALL be byte-identical.
+  recomputed, and the `.mfx` fileset is rebuilt to describe exactly the
+  parts the repaired archive ships: one `<File>` entry per shipped data
+  file with the MD5 hex digest of the bytes actually written (the
+  repaired `.acaml` included); entries for files that are not shipped
+  (partial snapshot copies whose completed run ships) are removed, and a
+  promoted snapshot entry is renamed to its regular name. A fileset that
+  already matches the shipped bytes SHALL stay byte-identical, as shall
+  the manifests when all injections are already committed.
 
 ### RS-4: Results extraction
 

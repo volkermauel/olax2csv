@@ -75,3 +75,14 @@
        Agilent ACAML object model (22 MeasData rows, 22 InjectionMetaData
        items deserialize cleanly); our own parser still reports 22/22
        measurements on the repaired archive.
+- [x] 24. Fileset exactness: the `.mfx` `<File>` list is rebuilt against the
+       parts actually shipped — identifiers are the MD5 of the bytes written
+       (repaired `.acaml` included), snapshot entries whose completed run
+       ships are removed instead of retargeted onto the regular name (which
+       had left a second, stale-identifier entry — the "invalid or missing
+       checksum" import error), promoted snapshots are renamed to their
+       regular name, and missing entries appended. A fileset already
+       matching the shipped bytes stays byte-identical. Locked by two new
+       fixture tests (drop+promote, no-op); RAD re-audit: 34 entries,
+       0 mismatches, 0 duplicates; Agilent checksum calculator VALID on the
+       rebuilt archive. 60/60 green.

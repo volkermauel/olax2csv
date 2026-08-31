@@ -247,7 +247,7 @@ export function rxInjectionACAML() {
 
 /* ---------- public builder ---------- */
 
-export function buildOlax({ withRx = true, snapshot = 'none', opc = false } = {}) {
+export function buildOlax({ withRx = true, snapshot = 'none', opc = false, mfx = null } = {}) {
   // Trace 1: a clean Gaussian peak + small baseline (exercises bestFloatSegment)
   const N1 = 1000, tStart1 = 0, tEnd1 = 600000; // ms -> 10 min run
   const dt1 = (tEnd1 - tStart1) / N1;
@@ -346,6 +346,8 @@ export function buildOlax({ withRx = true, snapshot = 'none', opc = false } = {}
     olaxEntries.push({ name: '_rels/.rels', data: enc(rels) });
     olaxEntries.push({ name: '[Content_Types].xml', data: enc(ct) });
   }
+
+  if (mfx) olaxEntries.push({ name: 'Run.mfx', data: enc(filesetManifest(mfx)) });
 
   return {
     buffer: makeZip(olaxEntries),
@@ -477,9 +479,14 @@ ${md}
 // Minimal Fileset so the .mfx repair path (Identifier follow + File entries
 // for unregistered .dx) can be tested.
 export function filesetManifest(paths = []) {
-  const files = paths.map(p => `    <File Path="${p}" IdentifierAlgorithm="MD5" Identifier="00000000000000000000000000000000">
+  const files = paths.map(p => {
+    const path = typeof p === 'string' ? p : p.path;
+    const id = typeof p === 'string' || !p.md5
+      ? '00000000000000000000000000000000' : p.md5;
+    return `    <File Path="${path}" IdentifierAlgorithm="MD5" Identifier="${id}">
       <Property Name="appVersion" Value="ACQ-2026-0710-1000-00001" />
-    </File>`).join('\n');
+    </File>`;
+  }).join('\n');
   return `<?xml version="1.0" encoding="utf-8"?>
 <Fileset IdentifierAlgorithm="" Identifier="" xmlns="urn:schemas-agilent-com:Fileset">
   <Files>
