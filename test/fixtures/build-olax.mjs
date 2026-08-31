@@ -309,6 +309,7 @@ export function buildOlax({ withRx = true, snapshot = 'none' } = {}) {
       { name: snapRxName, data: rxZip },
     );
   } else if (snapshot === 'duplicate') {
+    if (withRx) olaxEntries.push({ name: dxName.replace(/\.dx$/, '.rx'), data: rxZip });
     olaxEntries.push({ name: snapDxName, data: dxZip });
     olaxEntries.push({ name: snapRxName, data: rxZip });
   } else if (snapshot === 'rxOnly') {

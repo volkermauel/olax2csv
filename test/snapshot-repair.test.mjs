@@ -6,8 +6,8 @@
 
 import { test, before } from 'node:test';
 import assert from 'node:assert/strict';
-import { loadApp } from './harness.mjs';
-import { buildOlax, makeZip, enc, acmdInjection, acamlRegistry, TRACE1, TRACE2 } from './fixtures/build-olax.mjs';
+import { loadApp, blobToU8 } from './harness.mjs';
+import { buildOlax, makeZip, enc, acmdInjection, acamlRegistry, rxInjectionACAML, TRACE1, TRACE2 } from './fixtures/build-olax.mjs';
 
 let app;
 let fxOnly;       // run exists ONLY as snapshot-…-Run_Test.dx/.rx
@@ -23,8 +23,21 @@ before(() => {
 
 function reset() {
   app.store.files.length = 0;
+  app.store.containers.length = 0;
   app.activeTab = 'traces';
   app.captured = null;
+}
+
+function containerOf(name) {
+  const c = app.store.containers.find((x) => x.name === name);
+  if (!c) throw new Error('container not recorded: ' + name);
+  return c;
+}
+
+async function repairedU8(fx, name) {
+  const c = containerOf(name);
+  const blob = await app.buildRepairedContainer(fx.buffer, c.plan);
+  return blobToU8(blob);
 }
 
 test('repair ON (default): snapshot-only measurement is recovered with traces and results', async () => {
@@ -100,4 +113,131 @@ test('worker message threads the repair option', async () => {
   const g2 = [{ folderName: 'x.rslt', entries: [...flat.files.keys()].map((name) => ({ name, within: name })) }];
   const msg2 = app.buildWorkerMessage(flat, g2[0], 'f.zip');
   assert.ok(msg2.options && typeof msg2.options === 'object' && !('repairSnapshots' in msg2.options), 'no opts -> plain empty options');
+});
+
+/* ---------------- repair plan (container level) ---------------- */
+
+test('plan: flat container with snapshot-only run promotes dx+rx', async () => {
+  reset();
+  await app.parseOlax(fxOnly.buffer, 'snap-only.olax');
+  const c = containerOf('snap-only.olax');
+  assert.equal(c.applied, true);
+  assert.equal(c.olax, true);
+  assert.equal(c.plan.promote.map((p) => p.to).sort().join('|'), 'Run_Test.dx|Run_Test.rx');
+  assert.equal(c.plan.drop.join('|'), '');
+});
+
+test('plan: partial duplicates of completed runs are dropped, nothing promoted', async () => {
+  reset();
+  await app.parseOlax(fxDup.buffer, 'snap-dup.olax');
+  const c = containerOf('snap-dup.olax');
+  assert.equal(c.plan.promote.length, 0);
+  assert.equal(c.plan.drop.sort().join('|'), [
+    'snapshot-20260710 084732-Run_Test.dx',
+    'snapshot-20260710 084732-Run_Test.rx',
+  ].join('|'));
+});
+
+test('plan: OPC "%5c" and CM "/" separators, "+" and space ts forms', () => {
+  const names = [
+    'A.rslt%5csnapshot-20260710+084732-M 2026-07-10 08-41-14+02-00.dx',
+    'A.rslt%5csnapshot-20260710+084732-M 2026-07-10 08-41-14+02-00.rx',
+    'A.rslt%5cM 2026-07-10 08-41-14+02-00.pdf', // only the pdf counterpart exists
+    'B.rslt/snapshot-20260828 172148-N 2026-08-28 17-18-25+02-00.dx',
+    'B.rslt/snapshot-20260828 172148-N 2026-08-28 17-18-25+02-00.rx',
+    'B.rslt/N 2026-08-28 17-18-25+02-00.dx', // completed run exists -> drop
+    'C.rslt/Run.dx',
+  ];
+  const plan = app.computeContainerRepairPlan({ files: new Map(names.map((n) => [n, {}])) });
+  // A: both counterparts missing -> promote dx+rx.
+  // B: completed run's .dx exists (snapshot dx dropped) but its .rx is missing
+  //    (snapshot rx promoted) — the real-world "r005" mixed scenario.
+  assert.equal(plan.promote.map((p) => p.to).sort().join('|'), [
+    'A.rslt%5cM 2026-07-10 08-41-14+02-00.dx',
+    'A.rslt%5cM 2026-07-10 08-41-14+02-00.rx',
+    'B.rslt/N 2026-08-28 17-18-25+02-00.rx',
+  ].sort().join('|'));
+  assert.equal(plan.drop.join('|'), 'B.rslt/snapshot-20260828 172148-N 2026-08-28 17-18-25+02-00.dx');
+});
+
+/* ---------------- repaired container round-trips ---------------- */
+
+test('repaired container: snapshot-only run becomes a native regular run', async () => {
+  reset();
+  await app.parseOlax(fxOnly.buffer, 'snap-only.olax');
+  const u8 = await repairedU8(fxOnly, 'snap-only.olax');
+  const names = [...app.parseZip(u8).files.keys()].sort();
+  assert.ok(names.includes('Run_Test.dx'));
+  assert.ok(names.includes('Run_Test.rx'));
+  assert.ok(!names.some((n) => n.toLowerCase().includes('snapshot-')), 'no snapshot- names remain');
+
+  reset();
+  await app.parseOlax(u8.buffer, 'repaired.olax', { repairSnapshots: false });
+  assert.equal(app.allTraces().length, 2, 'repaired container parses natively (repair OFF)');
+  assert.equal(app.allResults().peaks.length, 1);
+});
+
+test('repaired container: partial snapshot duplicates are removed', async () => {
+  reset();
+  await app.parseOlax(fxDup.buffer, 'snap-dup.olax');
+  const u8 = await repairedU8(fxDup, 'snap-dup.olax');
+  const names = [...app.parseZip(u8).files.keys()];
+  assert.ok(names.includes('Run_Test.dx'));
+  assert.ok(!names.some((n) => n.toLowerCase().includes('snapshot-')));
+
+  reset();
+  await app.parseOlax(u8.buffer, 'repaired.olax', { repairSnapshots: false });
+  assert.equal(app.allTraces().length, 2);
+  assert.equal(app.allResults().peaks.length, 1);
+});
+
+test('repaired container: snapshot .rx is promoted next to the regular .dx', async () => {
+  reset();
+  await app.parseOlax(fxRxOnly.buffer, 'snap-rx.olax');
+  const u8 = await repairedU8(fxRxOnly, 'snap-rx.olax');
+  const names = [...app.parseZip(u8).files.keys()].sort();
+  assert.deepEqual(names.filter((n) => /run_test\.(dx|rx)$/i.test(n)), ['Run_Test.dx', 'Run_Test.rx']);
+
+  reset();
+  await app.parseOlax(u8.buffer, 'repaired.olax', { repairSnapshots: false });
+  assert.equal(app.allTraces().length, 2);
+  assert.equal(app.allResults().peaks.length, 1, 'results now native (no repair needed)');
+});
+
+test('CM zip: grouped .rslt with a snapshot-only result set round-trips', async () => {
+  const mkDx = makeZip([
+    { name: 'injection.acmd', data: enc(acmdInjection(10, 0, 1, 6000, 5, 3000, 'Test')) },
+    { name: `${TRACE1}.CH`, data: new Uint8Array(10 * 8) },
+    { name: `${TRACE2}.CH`, data: new Uint8Array(5 * 8) },
+    { name: '[Content_Types].xml', data: enc('<Types/>') },
+  ]);
+  const mkRx = makeZip([
+    { name: '[Content_Types].xml', data: enc('<Types/>') },
+    { name: 'Base/InjectionACAML', data: enc(rxInjectionACAML()) },
+  ]);
+  const buf = makeZip([
+    { name: 'OK.rslt/Run.dx', data: mkDx },
+    { name: 'OK.rslt/Run.rx', data: mkRx },
+    { name: 'OK.rslt/Run.acaml', data: enc(acamlRegistry()) },
+    { name: 'BROKEN.rslt/snapshot-20260828 172148-Run.dx', data: mkDx },
+    { name: 'BROKEN.rslt/snapshot-20260828 172148-Run.rx', data: mkRx },
+    { name: 'BROKEN.rslt/Run.acaml', data: enc(acamlRegistry()) },
+  ]);
+
+  reset();
+  await app.parseOlax(buf.buffer, 'cm.zip');
+  assert.equal(app.store.files.length, 2, 'both result sets parsed');
+  assert.equal(app.allTraces().length, 4, 'BROKEN recovered during parse');
+  assert.equal(app.allResults().peaks.length, 2);
+
+  const c = containerOf('cm.zip');
+  assert.equal(c.olax, false);
+  assert.equal(c.plan.promote.map((p) => p.to).sort().join('|'), 'BROKEN.rslt/Run.dx|BROKEN.rslt/Run.rx');
+  const u8 = blobToU8(await app.buildRepairedContainer(buf.buffer, c.plan));
+
+  reset();
+  await app.parseOlax(u8.buffer, 'repaired-cm.zip', { repairSnapshots: false });
+  assert.equal(app.store.files.length, 2);
+  assert.equal(app.allTraces().length, 4, 'repaired CM zip parses natively (repair OFF)');
+  assert.equal(app.allResults().peaks.length, 2);
 });

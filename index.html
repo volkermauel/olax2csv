@@ -46,6 +46,7 @@
       <button id="zipBtn" class="primary" disabled>Download traces as ZIP (CSV)</button>
       <button id="zipAllBtn" disabled>Download ALL traces as ZIP</button>
       <button id="xlsxBtn" class="primary" disabled>Download results as Excel (.xlsx)</button>
+      <button id="repairedBtn" disabled title="Download a copy of the container with snapshot repairs applied: measurements acquired under an unclosed snapshot session are renamed to their regular file names; partial snapshot duplicates of completed runs are removed.">Download repaired container(s)</button>
     </div>
     <div style="margin-top:10px" class="mono">
       <b>Raw traces → CSV</b>: columns <b>time_ms, time_s, time_min, value</b>, one <b>.dx</b> per measurement.<br/>
@@ -746,7 +747,8 @@ function parseInjectionACAML(xmlText, signalMap, ctx) {
    ============================ */
 
 let store = {
-  files: [],   // { name, measurementCount, traces:[], results:{peaks,compounds,calibration,injections} }
+  files: [],      // { name, measurementCount, traces:[], results:{peaks,compounds,calibration,injections} }
+  containers: [], // { name, file, plan:{promote:[{from,to}],drop:[]}, applied, olax } — per parsed input file
 };
 let activeTab = "traces";
 
@@ -1119,6 +1121,7 @@ async function parseContainer(arrayBuffer, fileName, opts) {
 
   const outer = parseZip(new Uint8Array(arrayBuffer));
   const groups = [...groupByRslt(outer).values()];
+  recordContainer(outer, fileName, opts);
 
   let work;
   if (groups.length) {
@@ -1148,6 +1151,83 @@ async function parseContainer(arrayBuffer, fileName, opts) {
 
 // Back-compat alias (existing callers / tests use parseOlax).
 async function parseOlax(arrayBuffer, fileName, opts) { return parseContainer(arrayBuffer, fileName, opts); }
+
+/* ---- repaired-container download ------------------------------------------
+   The repair plan is derived from entry NAMES only (central directory), so it is
+   computed on the main thread even when the heavy parsing runs in workers. A
+   "repaired" container is a re-stored copy of the original in which every
+   snapshot-<ts>-<name> file whose completed counterpart is missing is renamed
+   to <name> (promoted), and partial snapshot duplicates of completed runs are
+   dropped — the result set then natively includes all acquired measurements. */
+
+function computeContainerRepairPlan(outer) {
+  // Segment-anchored: the prefix must start a path segment — raw OPC names use
+  // "%5c" as separator, Content-Manager zips use "/".
+  const segSnap = /(^|[\/\\]|%5c)snapshot-\d{8}[ +]\d{6}-/i;
+  const names = [...outer.files.keys()];
+  const promote = [], drop = [];
+  const snaps = [];
+  const regularLC = new Set();
+  for (const n of names) {
+    if (segSnap.test(n)) snaps.push(n);
+    else regularLC.add(n.toLowerCase());
+  }
+  for (const n of snaps) {
+    const to = n.replace(segSnap, "$1");
+    if (regularLC.has(to.toLowerCase())) drop.push(n);   // completed run exists → partial duplicate
+    else promote.push({ from: n, to });                  // acquired but never committed → promote
+  }
+  return { promote, drop };
+}
+
+function recordContainer(outer, fileName, opts) {
+  store.containers.push({
+    name: fileName,
+    file: (opts && opts.file) || null,   // File ref for re-reading at download time
+    plan: computeContainerRepairPlan(outer),
+    applied: !opts || opts.repairSnapshots !== false,
+    olax: /\.olax$/i.test(fileName),
+  });
+}
+
+// Rebuild a container with the repair plan applied. Returns a stored-zip Blob;
+// entry order and untouched entry names are preserved.
+async function buildRepairedContainer(arrayBuffer, plan) {
+  const outer = parseZip(new Uint8Array(arrayBuffer));
+  const dropSet = new Set(plan.drop);
+  const promoteMap = new Map(plan.promote.map(p => [p.from, p.to]));
+  const files = [];
+  for (const [name] of outer.files) {
+    if (dropSet.has(name)) continue;
+    files.push({ name: promoteMap.get(name) || name, data: await readZipFile(outer, name) });
+  }
+  return zipStore(files);
+}
+
+async function downloadRepaired() {
+  try {
+    const todo = (store.containers || []).filter(c =>
+      c.applied && c.file && (c.plan.promote.length || c.plan.drop.length));
+    if (!todo.length) return;
+    const items = [];
+    for (const c of todo) {
+      const blob = await buildRepairedContainer(await c.file.arrayBuffer(), c.plan);
+      const stem = sanitizeName(c.name.replace(/\.(olax|zip)$/i, ""));
+      items.push({ name: stem + ".repaired." + (c.olax ? "olax" : "zip"), blob });
+    }
+    if (items.length === 1) {
+      downloadBlob(items[0].blob, items[0].name);
+    } else {
+      const wrap = zipStore(await Promise.all(items.map(async it => ({
+        name: it.name,
+        data: new Uint8Array(await it.blob.arrayBuffer()),
+      }))));
+      downloadBlob(wrap, "repaired-containers.zip");
+    }
+  } catch (e) {
+    alert("Repaired download failed: " + e.message);
+  }
+}
 
 /* ---- parallel parsing via Web Workers (map-reduce) -------------------------
    Each result set (.rslt) is independent, so parsing is embarrassingly parallel.
@@ -1246,7 +1326,7 @@ function buildWorkerMessage(outer, group, fileName, opts) {
       _raw: getFileSlice(outer, oe).slice(),
     };
   }
-  return { folderName: group.folderName, resultSet: group.folderName, sourceFile: fileName, entries, options: (opts && typeof opts === "object") ? opts : {} };
+  return { folderName: group.folderName, resultSet: group.folderName, sourceFile: fileName, entries, options: (opts && typeof opts === "object") ? { repairSnapshots: opts.repairSnapshots } : {} };
 }
 
 async function parseContainerParallel(arrayBuffer, fileName, onProgress, opts) {
@@ -1261,6 +1341,10 @@ async function parseContainerParallel(arrayBuffer, fileName, onProgress, opts) {
     (typeof URL !== "undefined") && typeof URL.createObjectURL === "function" &&
     groups.length >= 8;
   if (!canParallel) return parseContainer(arrayBuffer, fileName, opts);
+
+  // Name-level repair plan for the repaired-container download (see above);
+  // recorded here because the serial fallback path records it in parseContainer.
+  recordContainer(outer, fileName, opts);
 
   // Lightweight group descriptors (folderName + entry {name,within} only — no
   // bytes copied yet). Messages are built lazily inside the pool so only one
@@ -1485,6 +1569,9 @@ function updateButtons() {
   document.getElementById("zipBtn").disabled = !anySelected;
   document.getElementById("zipAllBtn").disabled = !hasTraces;
   document.getElementById("xlsxBtn").disabled = !hasResults;
+  const hasRepairs = (store.containers || []).some(c =>
+    c.applied && c.file && (c.plan.promote.length || c.plan.drop.length));
+  document.getElementById("repairedBtn").disabled = !hasRepairs;
   document.getElementById("clearBtn").disabled = store.files.length === 0;
 }
 
@@ -1627,6 +1714,7 @@ parseBtn.addEventListener("click", async () => {
     const parseOpts = { repairSnapshots: !repairEl || repairEl.checked !== false };
     setStatus("Parsing…", "warn");
     for (const f of fileEl.files) {
+      parseOpts.file = f; // kept for the repaired-container download (never sent to workers)
       logln("Loading:", f.name, "(" + f.size + " bytes)");
       const ab = await f.arrayBuffer();
       if (useParallel) {
@@ -1654,8 +1742,10 @@ parseBtn.addEventListener("click", async () => {
 document.getElementById("zipBtn").addEventListener("click", downloadSelectedZip);
 document.getElementById("zipAllBtn").addEventListener("click", downloadAllZip);
 document.getElementById("xlsxBtn").addEventListener("click", downloadExcel);
+document.getElementById("repairedBtn").addEventListener("click", downloadRepaired);
 document.getElementById("clearBtn").addEventListener("click", () => {
   store.files = [];
+  store.containers = [];
   activeTab = "traces";
   renderAll();
   setStatus("Cleared", "warn");
