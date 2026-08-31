@@ -86,3 +86,15 @@
        fixture tests (drop+promote, no-op); RAD re-audit: 34 entries,
        0 mismatches, 0 duplicates; Agilent checksum calculator VALID on the
        rebuilt archive. 60/60 green.
+- [x] 25. End-to-end regression guard for the re-import failure report: the
+       repaired archive was rebuilt in a REAL Chromium (deployed Pages
+       artifact) and re-audited — 22 InjectionMetaData rows, acaml checksum
+       valid per Agilent's own `AcamlChecksum.VerifyStream`, fileset 34
+       entries / 0 mismatches / 0 duplicates, every entry shaped like a
+       native `<File>` (appVersion property present), and our own parser
+       re-lists all 22 measurements from the repaired bytes. Three new
+       tests lock the invariants down: fileset mirrors the shipped parts
+       exactly (bidirectional, one entry per data part, MD5 per entry,
+       appVersion property on every entry), repaired archive re-parsed by
+       the app lists every committed measurement (the 7-vs-22 regression),
+       and non-manifest parts ship byte-identically. 63/63 green.

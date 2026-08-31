@@ -568,3 +568,82 @@ test('repaired olax: mfx with correct identifiers stays byte-identical', async (
   assert.equal(Buffer.compare(Buffer.from(out), Buffer.from(mfxBytes)), 0,
     'mfx byte-identical when already consistent');
 });
+
+test('repaired olax (commit repair): fileset mirrors the shipped parts',
+  async () => {
+  // Invariants an archive consumer validates: every <File> entry resolves to
+  // a shipped part whose bytes hash to the entry's MD5 identifier, every
+  // shipped data part has exactly one entry, and each entry carries the
+  // appVersion property the native fileset writer always emits.
+  const fx = buildCommitOlax();
+  reset();
+  await app.parseOlax(fx.buffer, 'commit.olax');
+  const u8 = await repairedU8(fx, 'commit.olax');
+  const z = app.parseZip(u8);
+  const mfxName = [...z.files.keys()].find(n => /\.mfx$/i.test(n));
+  const mfx = new TextDecoder().decode(await app.readZipFile(z, mfxName));
+
+  const entryRe = /<File Path="([^"]*)" IdentifierAlgorithm="MD5" Identifier="([0-9a-f]{32})"([\s\S]*?)<\/File>/g;
+  const seen = new Map();
+  for (const e of mfx.matchAll(entryRe)) {
+    assert.ok(!seen.has(e[1]), 'no duplicate Path entry: ' + e[1]);
+    seen.set(e[1], e[2]);
+    assert.match(e[3], /Property Name="appVersion" Value="[^"]+"/,
+      'entry carries an appVersion property: ' + e[1]);
+    const part = [...z.files.keys()].find(n => n.endsWith(e[1]));
+    assert.ok(part, 'entry resolves to a shipped part: ' + e[1]);
+    assert.equal(e[2], app.md5Hex(await app.readZipFile(z, part)),
+      'identifier = MD5 of shipped bytes: ' + e[1]);
+  }
+  const dataParts = [...z.files.keys()].filter(n =>
+    !n.endsWith('/') && !/\.mfx$/i.test(n) &&
+    !['[Content_Types].xml', '_rels/.rels'].includes(n));
+  assert.equal(seen.size, dataParts.length,
+    'one entry per shipped data part (acaml, dx, rx)');
+  for (const p of dataParts) {
+    const base = p.split('%5c').pop().split('/').pop();
+    assert.ok(seen.has(base), 'shipped part is listed: ' + p);
+  }
+});
+
+test('repaired olax re-parsed lists every committed measurement', async () => {
+  // The user-visible contract: after the repair the archive itself must
+  // expose all acquired measurements, not only the ones the snapshot
+  // session committed. Re-parse the repaired bytes through the app's own
+  // pipeline and count distinct measurements.
+  const fx = buildCommitOlax();
+  reset();
+  await app.parseOlax(fx.buffer, 'commit.olax');
+  const u8 = await repairedU8(fx, 'commit.olax');
+
+  reset();
+  const z = app.parseZip(u8);
+  await app.processResultSet(z, { containerName: 'commit-repaired.olax' }, {});
+  const meas = new Set(app.store.files[0].traces.map(t => t.measIndex));
+  assert.equal(meas.size, 3, 'all three injections are listed measurements');
+  const byMeas = new Map(app.store.files[0].traces.map(t => [t.measIndex, t]));
+  assert.equal(byMeas.size, 3);
+  const stems = [...byMeas.values()].map(t => t.srcStem);
+  assert.ok(stems.every(s => s), 'every measurement carries its source stem');
+});
+
+test('repaired olax carries non-manifest parts byte-identically', async () => {
+  // Data files never change during a repair: .dx/.rx (and anything else
+  // that is not the .acaml/.mfx manifest pair) must come out with the
+  // exact input bytes, so every checksum recorded elsewhere stays valid.
+  const fx = buildCommitOlax();
+  const zin = app.parseZip(new Uint8Array(fx.buffer));
+  reset();
+  await app.parseOlax(fx.buffer, 'commit.olax');
+  const u8 = await repairedU8(fx, 'commit.olax');
+  const z = app.parseZip(u8);
+  for (const [n] of zin.files) {
+    if (n.endsWith('/') || /\.(acaml|mfx)$/i.test(n)) continue;
+    const outName = [...z.files.keys()].find(x => x.endsWith(n));
+    assert.ok(outName, 'part still shipped: ' + n);
+    assert.equal(
+      app.md5Hex(await app.readZipFile(z, outName)),
+      app.md5Hex(await app.readZipFile(zin, n)),
+      'bytes unchanged for ' + n);
+  }
+});
