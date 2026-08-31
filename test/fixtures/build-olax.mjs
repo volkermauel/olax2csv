@@ -240,7 +240,7 @@ export function rxInjectionACAML() {
 
 /* ---------- public builder ---------- */
 
-export function buildOlax({ withRx = true } = {}) {
+export function buildOlax({ withRx = true, snapshot = 'none' } = {}) {
   // Trace 1: a clean Gaussian peak + small baseline (exercises bestFloatSegment)
   const N1 = 1000, tStart1 = 0, tEnd1 = 600000; // ms -> 10 min run
   const dt1 = (tEnd1 - tStart1) / N1;
@@ -273,16 +273,48 @@ export function buildOlax({ withRx = true } = {}) {
     { name: 'Run.acaml', data: enc(acamlRegistry()) },
   ];
 
-  if (withRx) {
-    const rxEntries = [
-      {
-        name: '[Content_Types].xml',
-        data: enc('<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Override PartName="/Base/InjectionACAML" ContentType="text/xml"/></Types>'),
-      },
-      { name: 'Base/InjectionACAML', data: enc(rxInjectionACAML()) },
-      { name: 'Base/AuditTrail', data: enc('audit') },
-    ];
-    olaxEntries.push({ name: dxName.replace(/\.dx$/, '.rx'), data: makeZip(rxEntries) });
+  // Snapshot variants ("snapshot mode left unclosed"):
+
+  //   none      – as before.
+
+  //   only      – the run exists ONLY as snapshot-<ts>-Run_Test.dx/.rx (the
+
+  //               completed counterpart was never written).
+
+  //   duplicate – regular Run_Test.dx/.rx PLUS a snapshot-… copy (snapshot is a
+
+  //               partial duplicate that must be ignored).
+
+  //   rxOnly    – regular Run_Test.dx but the processed results exist only as
+
+  //               snapshot-…-Run_Test.rx.
+
+  const rxEntries = [
+    {
+      name: '[Content_Types].xml',
+      data: enc('<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Override PartName="/Base/InjectionACAML" ContentType="text/xml"/></Types>'),
+    },
+    { name: 'Base/InjectionACAML', data: enc(rxInjectionACAML()) },
+    { name: 'Base/AuditTrail', data: enc('audit') },
+  ];
+  const rxZip = makeZip(rxEntries);
+  const snapDxName = 'snapshot-20260710 084732-Run_Test.dx';
+  const snapRxName = 'snapshot-20260710 084732-Run_Test.rx';
+
+  if (snapshot === 'only') {
+    olaxEntries.length = 0; // drop the regular run; keep only the manifest
+    olaxEntries.push(
+      { name: snapDxName, data: dxZip },
+      { name: 'Run.acaml', data: enc(acamlRegistry()) },
+      { name: snapRxName, data: rxZip },
+    );
+  } else if (snapshot === 'duplicate') {
+    olaxEntries.push({ name: snapDxName, data: dxZip });
+    olaxEntries.push({ name: snapRxName, data: rxZip });
+  } else if (snapshot === 'rxOnly') {
+    olaxEntries.push({ name: snapRxName, data: rxZip });
+  } else if (withRx) {
+    olaxEntries.push({ name: dxName.replace(/\.dx$/, '.rx'), data: rxZip });
   }
 
   return {
@@ -294,7 +326,7 @@ export function buildOlax({ withRx = true } = {}) {
       gaussian: Array.from(g),
       min1, max1,
       N2,
-      withRx,
+      withRx, snapshot,
       peak: withRx ? PEAK : null,
       compound: withRx ? COMPOUND : null,
       calibration: withRx ? CALIBRATION : null,

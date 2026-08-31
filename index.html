@@ -37,6 +37,11 @@
       <span id="status" class="pill warn">No file loaded</span>
       <progress id="progress" value="0" max="1" style="width:180px;height:14px"></progress>
     </div>
+    <div style="margin-top:6px" class="row">
+      <label class="mono" title="Include measurements that were acquired but never committed to the result set (an unclosed 'snapshot' session leaves them only as snapshot-* files). Snapshot copies are ignored when the completed run exists.">
+        <input type="checkbox" id="repairChk" checked> Repair snapshot result sets
+      </label>
+    </div>
     <div style="margin-top:10px" class="row">
       <button id="zipBtn" class="primary" disabled>Download traces as ZIP (CSV)</button>
       <button id="zipAllBtn" disabled>Download ALL traces as ZIP</button>
@@ -861,8 +866,18 @@ async function parseMeasurementTraces(zipView, dxName, measIndex, meta, srcStem)
 }
 
 // Parse the .rx for a given .dx name; return parsed result rows.
-async function parseMeasurementResults(zipView, dxName, measIndex, meta, signalMap) {
-  const rxName = dxName.replace(/\.dx$/i, ".rx");
+async function parseMeasurementResults(zipView, dxName, measIndex, meta, signalMap, opts) {
+  const repair = !opts || opts.repairSnapshots !== false;
+  let rxName = dxName.replace(/\.dx$/i, ".rx");
+  if (!zipView.files.has(rxName) && repair) {
+    // A result set only indexes committed injections; an unclosed "snapshot"
+    // session can leave the processed results solely as
+    // "snapshot-<ts>-<name>.rx". Fall back to that copy (silent repair).
+    const esc = rxName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const alt = [...zipView.files.keys()].find(n =>
+      new RegExp("^snapshot-\\d{8}[ +]\\d{6}-" + esc + "$", "i").test(n));
+    if (alt) rxName = alt;
+  }
   const sample = meta.sample || sampleNameFromDxPath(dxName);
   const ctx = {
     sourceFile: meta.resultSetLabel || meta.containerName || "",
@@ -961,12 +976,17 @@ function instrumentLabelFromFolder(rsltFolderName) {
   return m ? (m[1].toUpperCase() + m[2]) : "";
 }
 
-async function detectGroupMeta(view, rsltFolderName, containerName) {
+async function detectGroupMeta(view, rsltFolderName, containerName, opts) {
   let type = null;
-  const amxName = [...view.files.keys()].find(n => {
+  const names = [...view.files.keys()];
+  let amxName = names.find(n => {
     const lc = n.toLowerCase();
     return lc.endsWith(".amx") && !lc.includes("snapshot-");
   });
+  if (!amxName && (!opts || opts.repairSnapshots !== false)) {
+    // Snapshot-only result set: fall back to the snapshot copy of the method.
+    amxName = names.find(n => n.toLowerCase().endsWith(".amx"));
+  }
   if (amxName) {
     try { type = classifyAmx(await readZipFile(view, amxName)); } catch (_) {}
   }
@@ -981,17 +1001,45 @@ async function detectGroupMeta(view, rsltFolderName, containerName) {
 }
 
 // Process one ".rslt" result set (or a flat single-result zip) into store.files.
-async function processResultSet(view, meta) {
-  // Every .dx is one measurement. Skip snapshot-* re-exports (duplicate of an existing run).
-  const dxNames = [...view.files.keys()].filter(n => {
-    const lc = n.toLowerCase();
-    if (!lc.endsWith(".dx")) return false;
-    if (lc.includes("snapshot-")) return false;
-    return true;
-  });
+// opts.repairSnapshots (default true) — silent repair for unclosed "snapshot"
+// sessions: OpenLab writes data acquired under a snapshot as
+// "snapshot-<ts>-<original name>.dx/.rx". Those copies are PARTIAL captures, so
+// they are only used where the completed counterpart is missing, and processed
+// results are taken from a snapshot .rx only when the regular .rx is absent.
+async function processResultSet(view, meta, opts) {
+  const repair = !opts || opts.repairSnapshots !== false;
+  const snapMatch = (n) => n.match(/^snapshot-\d{8}[ +]\d{6}-(.+)$/i);
+  const allDx = [...view.files.keys()].filter(n => n.toLowerCase().endsWith(".dx"));
+  let dxNames, recovered = 0;
+  if (repair) {
+    const regular = allDx.filter(n => !snapMatch(n));
+    const regularLC = new Set(regular.map(n => n.toLowerCase()));
+    dxNames = regular.slice();
+    for (const n of allDx) {
+      const m = snapMatch(n);
+      if (!m || regularLC.has(m[1].toLowerCase())) continue; // full run exists → partial duplicate
+      dxNames.push(n);
+      recovered++;
+    }
+  } else {
+    // Legacy behaviour: skip any name mentioning snapshot-.
+    dxNames = allDx.filter(n => !n.toLowerCase().includes("snapshot-"));
+  }
   if (!dxNames.length) {
     logln(`  Result set "${meta.resultSetLabel}": no .dx — skipped.`);
     return;
+  }
+  if (recovered) {
+    // Slot recovered measurements into acquisition order via the time stamp
+    // embedded in the file name; zip order is the stable fallback.
+    const tsKey = (n) => {
+      const m = n.match(/(\d{4}-\d{2}-\d{2})[ +](\d{2}-\d{2}-\d{2})/);
+      return m ? m[1] + " " + m[2] : null;
+    };
+    dxNames = dxNames
+      .map((n, i) => ({ n, k: tsKey(n), i }))
+      .sort((a, b) => (a.k && b.k ? a.k.localeCompare(b.k) : a.i - b.i))
+      .map((d) => d.n);
   }
 
   // Root .acaml -> signal registry (one per result set)
@@ -1022,7 +1070,7 @@ async function processResultSet(view, meta) {
     const tr = await parseMeasurementTraces(view, dxNames[i], i, meta, srcStem);
     for (const t of tr.traces) traces.push(t);
     const m2 = Object.assign({}, meta, { sample: tr.sample });
-    const res = await parseMeasurementResults(view, dxNames[i], i, m2, signalMap);
+    const res = await parseMeasurementResults(view, dxNames[i], i, m2, signalMap, opts);
     if (res.hadResults) resultsFound++;
     results.peaks.push(...res.peaks);
     results.compounds.push(...res.compounds);
@@ -1066,7 +1114,7 @@ async function processResultSet(view, meta) {
 
 // Entry point for BOTH a single .olax (one .rslt, OPC-encoded) and a Content-Manager
 // .zip (many .rslt folders at depth). Each .rslt becomes one store.files entry.
-async function parseContainer(arrayBuffer, fileName) {
+async function parseContainer(arrayBuffer, fileName, opts) {
   document.getElementById("results").innerHTML = `<div class="mono">Parsing ${fileName}…</div>`;
 
   const outer = parseZip(new Uint8Array(arrayBuffer));
@@ -1085,8 +1133,8 @@ async function parseContainer(arrayBuffer, fileName) {
   }
 
   for (const w of work) {
-    const meta = await detectGroupMeta(w.view, w.folderName, fileName);
-    await processResultSet(w.view, meta);
+    const meta = await detectGroupMeta(w.view, w.folderName, fileName, opts);
+    await processResultSet(w.view, meta, opts);
   }
 
   renderAll();
@@ -1099,7 +1147,7 @@ async function parseContainer(arrayBuffer, fileName) {
 }
 
 // Back-compat alias (existing callers / tests use parseOlax).
-async function parseOlax(arrayBuffer, fileName) { return parseContainer(arrayBuffer, fileName); }
+async function parseOlax(arrayBuffer, fileName, opts) { return parseContainer(arrayBuffer, fileName, opts); }
 
 /* ---- parallel parsing via Web Workers (map-reduce) -------------------------
    Each result set (.rslt) is independent, so parsing is embarrassingly parallel.
@@ -1147,8 +1195,8 @@ self.onmessage = async function (e) {
         });
       }
       store.files.length = 0;
-      const meta = await detectGroupMeta(view, g.folderName, g.sourceFile || g.folderName);
-      await processResultSet(view, meta);
+      const meta = await detectGroupMeta(view, g.folderName, g.sourceFile || g.folderName, msg.options);
+      await processResultSet(view, meta, msg.options);
       if (store.files[0]) out.push(store.files[0]);
     }
     self.postMessage({ type: "done", chunkIndex: msg.chunkIndex, files: out });
@@ -1186,7 +1234,7 @@ function buildWorkerSource(xmldomText) {
 
 // Build a structured-clone-safe work item for one result set: each entry's
 // compressed bytes pre-sliced (_raw). The worker reconstructs a zip view from these.
-function buildWorkerMessage(outer, group, fileName) {
+function buildWorkerMessage(outer, group, fileName, opts) {
   const entries = {};
   for (const e of group.entries) {
     const oe = outer.files.get(e.name);
@@ -1198,10 +1246,10 @@ function buildWorkerMessage(outer, group, fileName) {
       _raw: getFileSlice(outer, oe).slice(),
     };
   }
-  return { folderName: group.folderName, resultSet: group.folderName, sourceFile: fileName, entries };
+  return { folderName: group.folderName, resultSet: group.folderName, sourceFile: fileName, entries, options: (opts && typeof opts === "object") ? opts : {} };
 }
 
-async function parseContainerParallel(arrayBuffer, fileName, onProgress) {
+async function parseContainerParallel(arrayBuffer, fileName, onProgress, opts) {
   document.getElementById("results").innerHTML = `<div class="mono">Parsing ${fileName}…</div>`;
   const outer = parseZip(new Uint8Array(arrayBuffer));
   const groups = [...groupByRslt(outer).values()];
@@ -1212,7 +1260,7 @@ async function parseContainerParallel(arrayBuffer, fileName, onProgress) {
   const canParallel = (typeof Worker !== "undefined") &&
     (typeof URL !== "undefined") && typeof URL.createObjectURL === "function" &&
     groups.length >= 8;
-  if (!canParallel) return parseContainer(arrayBuffer, fileName);
+  if (!canParallel) return parseContainer(arrayBuffer, fileName, opts);
 
   // Lightweight group descriptors (folderName + entry {name,within} only — no
   // bytes copied yet). Messages are built lazily inside the pool so only one
@@ -1573,6 +1621,10 @@ parseBtn.addEventListener("click", async () => {
     if (!fileEl.files?.length) return;
     store.files = []; // fresh parse
     const useParallel = (typeof Worker !== "undefined") && (typeof URL !== "undefined") && typeof URL.createObjectURL === "function";
+    // Repair option (pre-checked): recover measurements acquired under an
+    // unclosed "snapshot" session. Absent/unchecked → legacy strict filtering.
+    const repairEl = document.getElementById("repairChk");
+    const parseOpts = { repairSnapshots: !repairEl || repairEl.checked !== false };
     setStatus("Parsing…", "warn");
     for (const f of fileEl.files) {
       logln("Loading:", f.name, "(" + f.size + " bytes)");
@@ -1582,9 +1634,9 @@ parseBtn.addEventListener("click", async () => {
           const p = document.getElementById("progress");
           if (p) { p.max = total; p.value = done; }
           setStatus(`Parsing ${f.name}: ${done}/${total} result sets…`, "warn");
-        });
+        }, parseOpts);
       } else {
-        await parseOlax(ab, f.name);
+        await parseOlax(ab, f.name, parseOpts);
       }
     }
     const pDone = document.getElementById("progress"); if (pDone) { pDone.value = 0; pDone.max = 1; }
