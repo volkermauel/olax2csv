@@ -27,7 +27,6 @@
   </style>
 </head>
 <body>
-  <h1>OpenLab CDS .OLAX → CSV / XLSX (single HTML)</h1>
 
   <div class="card">
     <div class="row">
@@ -1188,7 +1187,7 @@ function computeContainerRepairPlan(outer) {
    is the MD5 over the <Doc> subtree, re-serialized with UTF-8 (no BOM), no
    XML declaration, no inter-element whitespace, and newline entitizing
    (\r -> &#xD;, \n -> &#xA; in text and attribute values). */
-function md5Base64(bytes) {
+function md5Digest(bytes) {
   const S = [7, 12, 17, 22, 5, 9, 14, 20, 4, 11, 16, 23, 6, 10, 15, 21];
   const K = new Int32Array(64);
   for (let i = 0; i < 64; i++) K[i] = Math.floor(Math.abs(Math.sin(i + 1)) * 4294967296);
@@ -1215,7 +1214,13 @@ function md5Base64(bytes) {
     a0 = (a0 + A) | 0; b0 = (b0 + B) | 0; c0 = (c0 + C) | 0; d0 = (d0 + D) | 0;
   }
   const out = new Uint8Array(16), odv = new DataView(out.buffer);
-  odv.setInt32(0, a0, true); odv.setInt32(4, b0, true); odv.setInt32(8, c0, true); odv.setInt32(12, d0, true);
+  odv.setInt32(0, a0, true); odv.setInt32(4, b0, true);
+  odv.setInt32(8, c0, true); odv.setInt32(12, d0, true);
+  return out;
+}
+
+function md5Base64(bytes) {
+  const out = md5Digest(bytes);
   let bin = "";
   for (let i = 0; i < 16; i++) bin += String.fromCharCode(out[i]);
   // inline base64 (btoa is not available in every host this code runs in)
@@ -1226,6 +1231,12 @@ function md5Base64(bytes) {
       B64[((bin.charCodeAt(i + 1) & 15) << 2) | (bin.charCodeAt(i + 2) >> 6)] + B64[bin.charCodeAt(i + 2) & 63];
   b64 += B64[bin.charCodeAt(15) >> 2] + B64[(bin.charCodeAt(15) & 3) << 4] + "==";   // 16th digest byte
   return b64;
+}
+
+function md5Hex(bytes) {
+  let hex = "";
+  for (const b of md5Digest(bytes)) hex += b.toString(16).padStart(2, "0");
+  return hex;
 }
 
 function acamlCanonicalDoc(xmlText) {
@@ -1316,18 +1327,21 @@ function acamlCanonicalDoc(xmlText) {
 
 // Rewrite snapshot references (promoted AND dropped ones — their regular
 // counterpart ships either way) to the regular names inside .acaml/.mfx
-// manifests, then recompute the ACAML MD5 checksum. Returns the original
-// bytes when nothing changed or when the checksum is not MD5 (only MD5 is
-// verifiable by this replica).
-function repairAcamlManifest(bytes, withinMap) {
+// manifests, commit injections the manifest never committed (recs, see
+// computeCommitRecords), then recompute the ACAML MD5 checksum. Returns the
+// original bytes when nothing changed or when the checksum is not MD5 (only
+// MD5 is verifiable by this replica).
+function repairAcamlManifest(bytes, withinMap, recs) {
   const hadBom = bytes.length > 2 && bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf;
   let text = new TextDecoder().decode(bytes);
   let changed = false;
   for (const [from, to] of withinMap) {
     if (text.includes(from)) { text = text.split(from).join(to); changed = true; }
   }
-  if (!changed) return bytes;
+  const commit = recs && recs.length;
+  if (!changed && !commit) return bytes;
   if (/<Checksum Algorithm="(?!MD5)/.test(text)) return bytes; // e.g. SHA1: cannot re-derive
+  if (commit) text = commitInjectionRecords(text, recs);
   const canonical = acamlCanonicalDoc(text);
   if (canonical != null) {
     text = text.replace(/(<Checksum Algorithm="MD5">\s*<Value>)[^<]*(<\/Value>)/,
@@ -1336,6 +1350,292 @@ function repairAcamlManifest(bytes, withinMap) {
   return hadBom
     ? new Uint8Array([0xef, 0xbb, 0xbf, ...encodeUTF8(text)])
     : encodeUTF8(text);
+}
+
+/* ---- commit injections that were acquired but never committed ----------
+   A result set exported from an abandoned snapshot session can contain .dx
+   files the .acaml manifest never committed: no <InjectionMetaData> entry,
+   no <Injections>/<MeasData> row, no link from the sample row. OpenLab
+   renders only what the manifest commits, so those injections stay
+   invisible even though their raw data ships in the archive. Committing
+   them uses two sources of truth:
+     - the .dx's own injection.acmd (acquisition time, sample name,
+       per-signal trace IDs), and
+     - the last committed injection of the same sample (method, setup,
+       container links, DA parameters, signal-row template).
+   No <ExternalResultPath> is written: the injection is committed in its
+   "acquired, not yet processed" state — the state OpenLab knows from a
+   run whose processing has not happened yet. Reprocessing in OpenLab
+   then produces real results. */
+
+function newGuid() {
+  const b = new Uint8Array(16);
+  if (typeof crypto !== "undefined" && crypto.getRandomValues)
+    crypto.getRandomValues(b);
+  else for (let i = 0; i < 16; i++) b[i] = Math.floor(Math.random() * 256);
+  b[6] = (b[6] & 0x0f) | 0x40;
+  b[8] = (b[8] & 0x3f) | 0x80;
+  const h = Array.from(b, x => x.toString(16).padStart(2, "0")).join("");
+  return h.slice(0, 8) + "-" + h.slice(8, 12) + "-" + h.slice(12, 16) +
+    "-" + h.slice(16, 20) + "-" + h.slice(20);
+}
+
+function escapeRe(s) {
+  return String(s).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function xmlEscVal(s) {
+  return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;").replace(/"/g, "&quot;")
+    .replace(/\r/g, "&#xD;").replace(/\n/g, "&#xA;").replace(/\t/g, "&#x9;");
+}
+
+function xmlUnesc(s) {
+  return String(s).replace(/&(amp|lt|gt|quot|apos|#x[0-9a-fA-F]+|#\d+);/g,
+    (_, e) => e === "amp" ? "&" : e === "lt" ? "<" : e === "gt" ? ">" :
+      e === "quot" ? '"' : e === "apos" ? "'" :
+      String.fromCodePoint(parseInt(e.slice(1), e[1] === "x" ? 16 : 10)));
+}
+
+// "2026-08-29T02:33:05.4103777+02:00" -> "2026-08-29T00:33:05.410Z"
+function isoUtcMs(dt) {
+  const m = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d+))?(Z|[+-]\d{2}:?\d{2})?$/
+    .exec(String(dt || "").trim());
+  if (!m) return null;
+  const [, y, mo, d, h, mi, s, frac, off] = m;
+  const ms = frac ? Math.round(parseFloat("0." + frac) * 1000) : 0;
+  let utc = Date.UTC(+y, +mo - 1, +d, +h, +mi, +s, ms);
+  if (off && off !== "Z") {
+    const om = /^([+-])(\d{2}):?(\d{2})$/.exec(off);
+    if (om) {
+      const mins = (+om[2]) * 60 + (+om[3]);
+      utc += (om[1] === "+" ? -mins : mins) * 60000;
+    }
+  }
+  const u = new Date(utc);
+  const p = (n, w) => String(n).padStart(w || 2, "0");
+  return u.getUTCFullYear() + "-" + p(u.getUTCMonth() + 1) + "-" +
+    p(u.getUTCDate()) + "T" + p(u.getUTCHours()) + ":" +
+    p(u.getUTCMinutes()) + ":" + p(u.getUTCSeconds()) + "." +
+    p(u.getUTCMilliseconds(), 3) + "Z";
+}
+
+// Per-signal facts needed to commit an injection, from its injection.acmd.
+// Only signals whose trace file actually ships in the .dx are kept.
+async function acmdSummaryForCommit(dxZip) {
+  const acmdName = [...dxZip.files.keys()]
+    .find(n => n.toLowerCase().endsWith("injection.acmd"));
+  if (!acmdName) return null;
+  const doc = xmlParse(new TextDecoder()
+    .decode(await readZipFile(dxZip, acmdName)));
+  const ns = "urn:schemas-agilent-com:acmd20";
+  const root = doc.documentElement;
+  if (!root) return null;
+  const signals = [];
+  for (const s of Array.from(doc.getElementsByTagNameNS(ns, "Signal"))) {
+    const traceId = getTextNS(s, ns, "TraceId");
+    if (!traceId) continue;
+    const has = ["CH", "IT", "UV"].some(ext => dxZip.files.has(traceId + "." + ext));
+    if (!has) continue;
+    const channel = getTextNS(s, ns, "ChannelName") ||
+      (getTextNS(s, ns, "Description") || "").split(",")[0];
+    signals.push({ traceId, channel });
+  }
+  return {
+    sample: getTextNS(root, ns, "SampleName"),
+    runDT: getTextNS(root, ns, "RunDateTime"),
+    signals
+  };
+}
+
+// Detect .dx files the (renamed) manifest never committed and build a
+// commit record for each. `entries`: [{name (in-archive), finalName}].
+// A record is built only when the .dx has an injection.acmd AND a
+// committed sibling of the same sample exists whose signal channels match
+// the .dx's exactly — otherwise the manifest lacks a template to describe
+// the raw data and the injection is left untouched.
+async function computeCommitRecords(outer, entries, withinMap) {
+  const acamlE = entries.find(e => /\.acaml$/i.test(e.finalName));
+  if (!acamlE) return [];
+  let text = new TextDecoder().decode(await readZipFile(outer, acamlE.name));
+  for (const [from, to] of withinMap)
+    if (text.includes(from)) text = text.split(from).join(to);
+  const imds = [...text.matchAll(/<InjectionMetaData [^>]*>[\s\S]*?<\/InjectionMetaData>/g)]
+    .map(m => m[0]);
+  if (!imds.length) return [];
+  const injOpen = text.indexOf("<Injections>");
+  const injClose = text.indexOf("</Injections>");
+  if (injOpen < 0 || injClose < 0 || !/<Samples>[\s\S]*?<\/Samples>/.test(text)) return [];
+  const injText = text.slice(injOpen, injClose);
+  const committed = new Set(imds.map(b =>
+    xmlUnesc((/RawDataFileName="([^"]*)"/.exec(b) || [])[1] || "").toLowerCase()));
+  const recs = [];
+  for (const e of entries) {
+    if (!/\.dx$/i.test(e.within)) continue;
+    if (committed.has(e.within.toLowerCase())) continue;
+    const acmd = await acmdSummaryForCommit(
+      parseZip(await readZipFile(outer, e.name)));
+    if (!acmd || !acmd.sample || !acmd.runDT) continue;
+    const sibName = new RegExp('SampleName="' + escapeRe(xmlEscVal(acmd.sample)) + '"');
+    const sib = [...imds].reverse().find(b => sibName.test(b));
+    if (!sib) continue;
+    const attr = re => (re.exec(sib) || [])[1] || "";
+    const sibGuid = attr(/InjectionId="([^"]*)"/);
+    const sibDx = xmlUnesc(attr(/RawDataFileName="([^"]*)"/));
+    const setupId = attr(/SampleSetupId="([^"]*)"/);
+    const repl = /-r(\d+)\.dx$/i.exec(e.within);
+    const sibBlock = sibGuid ? injText.match(
+      new RegExp('<MeasData id="' + escapeRe(sibGuid) + '"[\\s\\S]*?<\\/MeasData>')) : null;
+    if (!sibGuid || !setupId || !repl || !sibBlock) continue;
+    // The signal sets must match signal-for-signal (the manifest Signal
+    // <Name> is the acmd signal's channel, e.g. "PMP1E"); otherwise the
+    // sibling's signal rows cannot describe this .dx's raw data.
+    const sibSigs = [...sibBlock[0].matchAll(/<Signal\b[\s\S]*?<\/Signal>/g)]
+      .map(m => {
+        const names = [...m[0].matchAll(/<Name>([^<]*)<\/Name>/g)];
+        return {
+          channel: (names[names.length - 1] || [])[1] || "",
+          traceId: (/<TraceID>([^<]*)<\/TraceID>/.exec(m[0]) || [])[1] || ""
+        };
+      });
+    const byChannel = new Map(acmd.signals.map(s => [s.channel, s.traceId]));
+    if (sibSigs.length !== acmd.signals.length ||
+        !sibSigs.every(s => byChannel.has(s.channel))) continue;
+    recs.push({
+      dxName: e.within,
+      guid: newGuid(),
+      repl: Number(repl[1]),
+      runDT: acmd.runDT,
+      setupId, sibGuid, sibDx,
+      sibBlock: sibBlock[0],
+      sibImd: sib,
+      traceRepl: sibSigs.map(s => ({ from: s.traceId, to: byChannel.get(s.channel) }))
+        .filter(t => t.from !== t.to)
+    });
+  }
+  return recs;
+}
+
+// Splice the commit records into the manifest text: MeasData row, sample
+// link, and InjectionMetaData entry per injection (one shared GUID).
+function commitInjectionRecords(text, recs) {
+  const order = [...recs].sort((a, b) => a.repl - b.repl);
+
+  const imd = order.map(r => r.sibImd
+    .replace('InjectionId="' + r.sibGuid + '"', 'InjectionId="' + r.guid + '"')
+    .replace(/RawDataFileName="[^"]*"/, 'RawDataFileName="' + xmlEscVal(r.dxName) + '"')
+    .replace(/InjectionAcqDateTime="[^"]*"/,
+      'InjectionAcqDateTime="' + (isoUtcMs(r.runDT) || "") + '"')
+    .replace(/LastModifiedDateTime="[^"]*"/,
+      'LastModifiedDateTime="' + (isoUtcMs(r.runDT) || "") + '"')
+    .replace(/<ReplicateNumber val="\d+" ?\/>/,
+      '<ReplicateNumber val="' + r.repl + '" />')
+  ).join("");
+  if (!text.includes("</ArrayOfInjectionMetaData>")) return text;
+  text = text.replace("</ArrayOfInjectionMetaData>",
+    imd + "</ArrayOfInjectionMetaData>");
+
+  const md = order.map(r => {
+    let b = r.sibBlock
+      .replace('id="' + r.sibGuid + '"', 'id="' + r.guid + '"')
+      .split(xmlEscVal(r.sibDx)).join(xmlEscVal(r.dxName));
+    for (const t of r.traceRepl)
+      b = b.split("<TraceID>" + t.from + "</TraceID>")
+        .join("<TraceID>" + t.to + "</TraceID>");
+    return b
+      .replace(/(<Signal id=")[0-9a-fA-F-]{36}(")/g, (m, a, z) => a + newGuid() + z)
+      .replace(/<OrderNo val="\d+" ?\/>/, '<OrderNo val="' + r.repl + '" />')
+      .replace(/20\d{2}-\d{2}-\d{2}T[\d:.]+(?:Z|[+-]\d{2}:\d{2})/g, r.runDT)
+      .replace(/[ \t]*\r?\n?[ \t]*<ExternalResultPath>[^<]*<\/ExternalResultPath>/, "");
+  }).join("\n");
+  if (!text.includes("</Injections>")) return text;
+  text = text.replace("</Injections>", md + "</Injections>");
+
+  // Link each new injection from its sample's row in <Samples>.
+  const sm = /<Samples>[\s\S]*?<\/Samples>/.exec(text);
+  if (sm) {
+    let s = sm[0];
+    const bySetup = new Map();
+    for (const r of order) {
+      if (!bySetup.has(r.setupId)) bySetup.set(r.setupId, []);
+      bySetup.get(r.setupId).push(r);
+    }
+    for (const [setupId, rs] of bySetup) {
+      const blocks = [...s.matchAll(/<MeasData id="[^"]*"[^>]*>[\s\S]*?<\/MeasData>/g)];
+      const blk = blocks.find(b => b[0].includes('<SampleSetup_ID id="' + setupId + '"'));
+      if (!blk) continue;
+      const indent = (/([ \t]*)<InjectionMeasData_ID/.exec(blk[0]) || [])[1] || "";
+      const add = rs.map(r => indent + '<InjectionMeasData_ID id="' + r.guid +
+        '" ver="0" />').join("\n");
+      s = s.slice(0, blk.index) +
+        blk[0].replace(/\s*<\/MeasData>$/, "\n" + add + indent + "</MeasData>") +
+        s.slice(blk.index + blk[0].length);
+    }
+    text = text.slice(0, sm.index) + s + text.slice(sm.index + sm[0].length);
+  }
+  return text;
+}
+
+// Fileset (.mfx) repair: snapshot-name retargeting plus keeping the Fileset
+// consistent with the repaired archive — the .acaml's MD5 Identifier
+// follows its repaired bytes, and shipped .dx files the abandoned session
+// never registered get File entries of their own.
+function repairMfxManifest(bytes, withinMap, ctx) {
+  const hadBom = bytes.length > 2 && bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf;
+  let text = new TextDecoder().decode(bytes);
+  let changed = false;
+  for (const [from, to] of withinMap)
+    if (text.includes(from)) { text = text.split(from).join(to); changed = true; }
+  if (ctx && ctx.acaml) {
+    const re = new RegExp('(<File Path="' + escapeRe(xmlEscVal(ctx.acaml.name)) +
+      '" IdentifierAlgorithm="MD5" Identifier=")[0-9a-fA-F]*(")');
+    if (re.test(text)) {
+      text = text.replace(re, "$1" + md5Hex(ctx.acaml.data) + "$2");
+      changed = true;
+    }
+  }
+  if (ctx && ctx.addFiles && ctx.addFiles.length) {
+    const listed = new Set([...text.matchAll(/<File Path="([^"]*)"/g)]
+      .map(f => xmlUnesc(f[1]).toLowerCase()));
+    const missing = ctx.addFiles.filter(f => !listed.has(f.name.toLowerCase()));
+    if (missing.length) {
+      const appVer = (/Property Name="appVersion" Value="(ACQ-[^"]*)"/.exec(text) || [])[1];
+      const prop = appVer ? "\n      <Property Name=\"appVersion\" Value=\"" + appVer + "\" />" : "";
+      const add = missing.map(f =>
+        "    <File Path=\"" + xmlEscVal(f.name) + "\" IdentifierAlgorithm=\"MD5\" " +
+        "Identifier=\"" + f.md5 + "\">" + prop + "\n    </File>").join("\n");
+      text = text.replace(/(\s*)<\/Files>/, "$1" + add + "$1</Files>");
+      changed = true;
+    }
+  }
+  if (!changed) return bytes;
+  return hadBom
+    ? new Uint8Array([0xef, 0xbb, 0xbf, ...encodeUTF8(text)])
+    : encodeUTF8(text);
+}
+
+// Quick check used by the download gate: does any group of this container
+// hold .dx files its manifest never committed?
+async function olaxHasUncommittedDx(arrayBuffer) {
+  const outer = parseZip(new Uint8Array(arrayBuffer));
+  const plan = computeContainerRepairPlan(outer);
+  const dropSet = new Set(plan.drop);
+  const promoteMap = new Map(plan.promote.map(p => [p.from, p.to]));
+  for (const g of resultGroups(outer)) {
+    const withinOf = full =>
+      g.key && full.startsWith(g.key + "/") ? full.slice(g.key.length + 1) : full;
+    const withinMap = [
+      ...plan.promote.map(p => [withinOf(p.from), withinOf(p.to)]),
+      ...plan.drop.map(n => [n, n.replace(SNAPSHOT_SEG, "$1")])
+        .map(([f, t]) => [withinOf(f), withinOf(t)]),
+    ];
+    const entries = g.entries
+      .filter(e => !dropSet.has(e.name))
+      .map(e => ({ name: e.name, finalName: promoteMap.get(e.name) || e.name }))
+      .map(e => ({ ...e, within: withinOf(e.finalName) }));
+    if ((await computeCommitRecords(outer, entries, withinMap)).length) return true;
+  }
+  return false;
 }
 
 function recordContainer(outer, fileName, opts) {
@@ -1348,6 +1648,22 @@ function recordContainer(outer, fileName, opts) {
   });
 }
 
+// A container's result-set groups; a flat container (no .rslt folders)
+// counts as one group.
+function resultGroups(outer) {
+  let groups = [...groupByRslt(outer).values()];
+  if (!groups.length) {
+    // Back-compat flat container (no .rslt folder): whole zip = one result
+    // set. OPC wrapper parts are never result-set content.
+    const isWrapper = n => n === "[Content_Types].xml" || n === "_rels/.rels" ||
+      /^_rels\//.test(n) || /^package\//.test(n);
+    groups = [{ key: "", folderName: null,
+      entries: [...outer.files.keys()].filter(n => !isWrapper(n))
+        .map(n => ({ within: n, name: n })) }];
+  }
+  return groups;
+}
+
 // Build repaired .olax archive(s) from a container. An .olax holds exactly ONE
 // result set, so a Content-Manager .zip with N .rslt folders yields N .olax
 // files (kept only when repairs exist). Snapshot promotions are renamed,
@@ -1357,14 +1673,14 @@ function recordContainer(outer, fileName, opts) {
 //  - zip CRC32: recomputed for every entry we write (zipStore), inner .dx/.rx
 //    zips are carried byte-exact, so all CRCs stay valid.
 //  - _rels/.rels: references EVERY part (snapshots included) — rewritten so it
-//    matches the repaired part list exactly (removed targets deleted, promoted
-//    targets renamed); synthesized when the input is a bare CM .zip.
+//    matches the repaired part list exactly (removed targets deleted,
+//    promoted targets renamed); synthesized when the input is a bare CM .zip.
 //  - [Content_Types].xml: extension-based, renames cannot invalidate it;
 //    carried over verbatim from OPC inputs, synthesized for CM .zip inputs.
-//  - .acaml/.mfx manifests: deliberately byte-identical. Their <Checksum
-//    Algorithm="MD5"> covers an unknown canonicalization (verified: not a
-//    preimage of the file or any simple section), so editing them risks
-//    OpenLab rejecting the manifest. Our parser never reads the manifest.
+//  - .acaml: snapshot references retargeted, uncommitted injections
+//    committed (see computeCommitRecords), MD5 checksum recomputed.
+//  - .mfx: paths retargeted, .acaml MD5 Identifier kept in step, File
+//    entries added for shipped .dx files the manifest never registered.
 async function buildRepairedOlax(arrayBuffer, containerName) {
   const outer = parseZip(new Uint8Array(arrayBuffer));
   const plan = computeContainerRepairPlan(outer);
@@ -1374,15 +1690,7 @@ async function buildRepairedOlax(arrayBuffer, containerName) {
   const stem = sanitizeName((containerName || "resultset").replace(/\.(olax|zip)$/i, "").replace(/\.rslt$/i, ""));
   const REL_TYPE = "urn:schemas-agilent-com:OpenLabArchive";
 
-  let groups = [...groupByRslt(outer).values()];
-  if (!groups.length) {
-    // Back-compat flat container (no .rslt folder): whole zip = one result set.
-    // OPC wrapper parts are never result-set content.
-    const isWrapper = n => n === "[Content_Types].xml" || n === "_rels/.rels" ||
-      /^_rels\//.test(n) || /^package\//.test(n);
-    groups = [{ key: "", folderName: null,
-      entries: [...outer.files.keys()].filter(n => !isWrapper(n)).map(n => ({ within: n, name: n })) }];
-  }
+  const groups = resultGroups(outer);
 
   // Wrapper parts to carry over verbatim when the input already is an OPC package.
   const inGroup = new Set(groups.flatMap(g => g.entries.map(e => e.name)));
@@ -1400,27 +1708,57 @@ async function buildRepairedOlax(arrayBuffer, containerName) {
     // Manifest-level rename map (within-name level): every snapshot entry maps
     // to its regular counterpart — promoted files are renamed, dropped ones
     // leave the regular file shipped, so retargeting is always resolvable.
-    const withinOf = (full) => g.key && full.startsWith(g.key + "/") ? full.slice(g.key.length + 1) : full;
+    const withinOf = (full) =>
+      g.key && full.startsWith(g.key + "/") ? full.slice(g.key.length + 1) : full;
     const withinMap = [
       ...plan.promote.map(p => [withinOf(p.from), withinOf(p.to)]),
-      ...plan.drop.map(n => [n, n.replace(SNAPSHOT_SEG, "$1")]).map(([f, t]) => [withinOf(f), withinOf(t)]),
+      ...plan.drop.map(n => [n, n.replace(SNAPSHOT_SEG, "$1")])
+        .map(([f, t]) => [withinOf(f), withinOf(t)]),
     ];
-    for (const e of g.entries) {
-      if (dropSet.has(e.name)) continue;
-      const finalName = promoteMap.get(e.name) || e.name;
-      const opc = hasWrapper ? finalName
-        : g.folderName ? g.key + "%5c" + finalName.slice(g.key.length + 1).replace(/\//g, "%5c")
-        : stem + ".rslt%5c" + finalName.replace(/\//g, "%5c");
-      const data = await readZipFile(outer, e.name);
-      files.push({
-        name: opc,
-        data: /\.(acaml|mfx)$/i.test(e.name) && withinMap.length
-          ? repairAcamlManifest(data, withinMap)
-          : data,
-      });
+    const entries = g.entries
+      .filter(e => !dropSet.has(e.name))
+      .map(e => ({ name: e.name, finalName: promoteMap.get(e.name) || e.name }))
+      .map(e => ({ ...e, within: withinOf(e.finalName) }));
+
+    // Commit records for .dx files the .acaml never committed.
+    const recs = await computeCommitRecords(outer, entries, withinMap);
+    const acamlE = entries.find(e => /\.acaml$/i.test(e.finalName));
+    const acamlFinal = acamlE && (withinMap.length || recs.length) ? {
+      name: acamlE.within,
+      data: repairAcamlManifest(
+        await readZipFile(outer, acamlE.name), withinMap, recs)
+    } : null;
+    if (recs.length)
+      logln(`  ${g.folderName || stem}: committing ${recs.length} acquired-but-` +
+        `uncommitted injection(s) into the manifest.`);
+
+    let mfxIdx = -1, mfxData = null;
+    for (let i = 0; i < entries.length; i++) {
+      const e = entries[i];
+      const opc = hasWrapper ? e.finalName
+        : g.folderName
+          ? g.key + "%5c" + e.finalName.slice(g.key.length + 1).replace(/\//g, "%5c")
+          : stem + ".rslt%5c" + e.finalName.replace(/\//g, "%5c");
+      let data = await readZipFile(outer, e.name);
+      if (/\.acaml$/i.test(e.finalName) && acamlFinal) data = acamlFinal.data;
+      if (/\.mfx$/i.test(e.finalName)) { mfxIdx = files.length; mfxData = data; }
+      files.push({ name: opc, data });
     }
     if (!files.length) continue;
-    if (!files.length) continue;
+
+    if (mfxIdx >= 0 && (withinMap.length || acamlFinal)) {
+      const addFiles = [];
+      entries.forEach((e, i) => {
+        if (!/\.dx$/i.test(e.finalName)) return;
+        addFiles.push({ name: e.within, md5: md5Hex(files[i].data) });
+      });
+      const repaired = repairMfxManifest(mfxData, withinMap, {
+        acaml: acamlFinal,
+        addFiles
+      });
+      if (repaired !== mfxData)
+        files[mfxIdx] = { name: files[mfxIdx].name, data: repaired };
+    }
 
     // _rels/.rels must list exactly the parts we ship (plus the wrapper).
     const keep = new Set([...files.map(f => f.name), ...wrapperFiles.map(w => w.name)]);
@@ -1465,8 +1803,16 @@ async function buildRepairedOlax(arrayBuffer, containerName) {
 
 async function downloadRepaired() {
   try {
-    const todo = (store.containers || []).filter(c =>
-      c.applied && c.file && (c.plan.promote.length || c.plan.drop.length));
+    // Snapshot promotions/drops, or injections the manifest never
+    // committed — either way the repaired download has work to do.
+    const todo = [];
+    for (const c of (store.containers || [])) {
+      if (!c.applied || !c.file) continue;
+      if (c.plan.promote.length || c.plan.drop.length) { todo.push(c); continue; }
+      try {
+        if (await olaxHasUncommittedDx(await c.file.arrayBuffer())) todo.push(c);
+      } catch (e) { /* unreadable — nothing repairable */ }
+    }
     if (!todo.length) return;
     const items = [];
     for (const c of todo) {
@@ -2011,6 +2357,10 @@ document.getElementById("clearBtn").addEventListener("click", () => {
 
 setStatus("No file loaded", "warn");
 logln("Ready.");
+
+// Build stamp: the deploy pipeline replaces these tokens (short commit SHA +
+// UTC build time). With the raw placeholders (local file, tests) the badge
+// stays hidden.
 </script>
 
 <!-- SheetJS Community Edition (xlsx) — embedded for offline single-file use -->

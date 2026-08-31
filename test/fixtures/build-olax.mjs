@@ -126,11 +126,13 @@ ${inj}
 </ACAML>`;
 }
 
-export function acmdInjection(N1, min1, max1, tEnd1, N2, tEnd2, sampleName) {
+export function acmdInjection(N1, min1, max1, tEnd1, N2, tEnd2, sampleName,
+  runDT = '2026-07-10T10:00:00.0000000+02:00', traceA = TRACE1, traceB = TRACE2) {
   return `<?xml version="1.0" encoding="utf-8"?>
 <Injection xmlns="urn:schemas-agilent-com:acmd20">${sampleName ? `\n  <SampleName>${sampleName}</SampleName>` : ''}
+  <RunDateTime>${runDT}</RunDateTime>
   <Signal>
-    <TraceId>${TRACE1}</TraceId>
+    <TraceId>${traceA}</TraceId>
     <DeviceName>SIMDEV</DeviceName>
     <ChannelName>SIM1A</ChannelName>
     <Description>SIM1A,Wavelength=220 nm</Description>
@@ -144,7 +146,7 @@ export function acmdInjection(N1, min1, max1, tEnd1, N2, tEnd2, sampleName) {
     <Slope>1</Slope>
   </Signal>
   <Signal>
-    <TraceId>${TRACE2}</TraceId>
+    <TraceId>${traceB}</TraceId>
     <DeviceName>SIMDEV</DeviceName>
     <ChannelName>SIM1Z</ChannelName>
     <Description>SIM1Z,Zero baseline</Description>
@@ -360,4 +362,172 @@ export function buildOlax({ withRx = true, snapshot = 'none', opc = false } = {}
       calibration: withRx ? CALIBRATION : null,
     },
   };
+}
+
+/* ---------- full-structure result-set manifest (commit scenarios) ---------- */
+
+// Mirrors the .acaml OpenLab actually writes: DocInfo custom field
+// "InjectionMetaDataItems" with <ArrayOfInjectionMetaData>, Content/Injections
+// <MeasData> rows (one per injection, with Signal rows), and Content/Samples
+// (setup + sample row linking its injections). Used to test committing
+// .dx files that were acquired but never committed to the manifest.
+export const SETUP1 = 'dddddddd-0000-4000-8000-0000000000aa';
+export const METHOD1 = 'dddddddd-0000-4000-8000-0000000000bb';
+export const CONTAINER1 = 'dddddddd-0000-4000-8000-0000000000cc';
+export const SAMPLE_ROW = 'dddddddd-0000-4000-8000-0000000000dd';
+
+const sigBlock = (dx, sigName, chan, desc, traceId, type) => `      <Signal id="${sigName}-s" ver="0">
+        <ComplexCustomFields />
+        <BinaryData>
+          <DataItem>
+            <Name>${dx}</Name>
+            <OriginalFilePath>${dx}</OriginalFilePath>
+            <Data><DataFileReference><Path>${dx}</Path></DataFileReference></Data>
+          </DataItem>
+        </BinaryData>
+        <Name>${sigName}</Name>
+        <Description>${desc}</Description>
+        <Type>${type}</Type>
+        <TraceID>${traceId}</TraceID>
+        <UserGenerated>false</UserGenerated>
+        <AutomationGenerated>false</AutomationGenerated>
+        <DetectorName>SIMDEV</DetectorName>
+        <DetectorInstance>1</DetectorInstance>
+        <ChannelName>${chan}</ChannelName>
+        <PeakDeletions />
+        <InstrumentModule_ID id="${METHOD1}" />
+      </Signal>`;
+
+// rows: [{ dx, guid, repl, runDT (local ISO), utcDT (UTC ISO), rx }]
+export function acamlManifest(rows) {
+  const imd = rows.map(r => `          <InjectionMetaData AcqMethodName="FixtureMethod" DaMethodName="" ExpectedBarcode="" InjectionAcqDateTime="${r.utcDT}" InjectionId="${r.guid}" InjectorPosition="Front" InstrumentName="SIM-HPLC" LastModifiedDateTime="${r.utcDT}" BracketingType="Undefined" RawDataFileName="${r.dx}" SampleDescription="" SampleLabel="" SampleName="Std" SampleSetupId="${SETUP1}" SampleType="Sample" SequenceName="FixtureSeq" VialNumber="1">
+              <LimsIds key="" />
+              <Locked>false</Locked>
+              <Dil>1;1</Dil>
+              <Mult>1;1</Mult>
+              <ReplicateNumber val="${r.repl}" />
+              <SampleAmount val="0" unit="" />
+              <SampleInjectionsCount val="3" />
+              <SampleOrderNumber val="1" />
+            </InjectionMetaData>`).join('\n');
+  const md = rows.map(r => `        <MeasData id="${r.guid}" ver="0">
+          <Info>
+            <CreatedBy><Username>tester</Username></CreatedBy>
+            <CreatedDate>${r.runDT}</CreatedDate>
+            <LastModifiedBy><Username>tester</Username></LastModifiedBy>
+            <LastModifiedDate>${r.runDT}</LastModifiedDate>
+          </Info>
+          <ComplexCustomFields />
+          <BinaryData>
+            <DataItem>
+              <Name>${r.dx}</Name>
+              <OriginalFilePath>/CMC/Results/Fixture.rslt</OriginalFilePath>
+              <Data><DataFileReference><Path>${r.dx}</Path></DataFileReference></Data>
+            </DataItem>
+          </BinaryData>
+          <AcqParam>
+            <Method_ID id="${METHOD1}" ver="0" />
+            <OrderNo val="${r.repl}" />
+          </AcqParam>
+${sigBlock(r.dx, 'SIM1A', 'A', 'SIM1A,Wavelength=220 nm', r.traceA, 'Chromatogram')}
+${sigBlock(r.dx, 'SIM1Z', 'Z', 'SIM1Z,Zero baseline', r.traceB, 'InstrumentCurve')}
+          <InjectionVolume val="20" unit="µL" />
+          <DiagnosticData />
+${r.rx ? `          <ExternalResultPath>${r.rx}</ExternalResultPath>\n` : ''}          <SampleContainerInfo_ID id="${CONTAINER1}" ver="0" />
+          <SampleLocationIdentifier />
+        </MeasData>`).join('\n');
+  const refs = rows.map(r => `          <InjectionMeasData_ID id="${r.guid}" ver="0" />`).join('\n');
+  return `<?xml version="1.0" encoding="utf-8"?>
+<ACAML xmlns="urn:schemas-agilent-com:acaml21" schemaversion="2.1.30.999">
+<Checksum Algorithm="MD5"><Value>placeholder==</Value></Checksum>
+ <Doc>
+  <DocInfo>
+   <CustomField Name="CreatedByUserDisplayName"><TypedValue>tester</TypedValue></CustomField>
+   <CustomField Name="InjectionMetaDataItems">
+    <Xml>
+      <ArrayOfInjectionMetaData>
+${imd}
+      </ArrayOfInjectionMetaData>
+    </Xml>
+   </CustomField>
+  </DocInfo>
+  <Content>
+   <Method id="${METHOD1}" ver="0"><Info /><Name>FixtureMethod</Name></Method>
+   <Samples>
+    <Setup id="${SETUP1}" ver="0">
+     <Info><CreatedBy><Username>tester</Username></CreatedBy><CreatedDate>2026-07-10T09:00:00.0000000+02:00</CreatedDate></Info>
+     <IdentParam><Name>Std</Name><Description /><ProjectID>CMC</ProjectID><ExpectedBarcode /></IdentParam>
+     <AcqParam><OrderNo val="1" /><VialNumber>1</VialNumber><NumberOfInjections val="3" /><InjectionVolume val="20" unit="µL" /></AcqParam>
+    </Setup>
+    <MeasData id="${SAMPLE_ROW}" ver="0">
+      <AcqParam><VialNumber>1</VialNumber><NumberOfInjections val="3" /></AcqParam>
+      <SampleSetup_ID id="${SETUP1}" ver="0" />
+${refs}
+      <DiagnosticData />
+    </MeasData>
+   </Samples>
+   <Injections>
+${md}
+   </Injections>
+  </Content>
+ </Doc>
+</ACAML>`;
+}
+
+// Minimal Fileset so the .mfx repair path (Identifier follow + File entries
+// for unregistered .dx) can be tested.
+export function filesetManifest(paths = []) {
+  const files = paths.map(p => `    <File Path="${p}" IdentifierAlgorithm="MD5" Identifier="00000000000000000000000000000000">
+      <Property Name="appVersion" Value="ACQ-2026-0710-1000-00001" />
+    </File>`).join('\n');
+  return `<?xml version="1.0" encoding="utf-8"?>
+<Fileset IdentifierAlgorithm="" Identifier="" xmlns="urn:schemas-agilent-com:Fileset">
+  <Files>
+    <File Path="Run.acaml" IdentifierAlgorithm="MD5" Identifier="00000000000000000000000000000000">
+      <Property Name="appVersion" Value="ACQ-2026-0710-1000-00001" />
+    </File>
+${files}
+  </Files>
+</Fileset>`;
+}
+
+// A result set where only r001 was committed: r002/r003 .dx were acquired
+// (with per-injection trace GUIDs and RunDateTime in their injection.acmd)
+// but the session ended before the manifest was updated — the state an
+// abandoned snapshot session leaves behind.
+export function buildCommitOlax({ healthy = false } = {}) {
+  const mkDx = (i, runDT) => {
+    const tA = `eeeeeeee-0000-4000-8000-00000000000${i}a`;
+    const tB = `eeeeeeee-0000-4000-8000-00000000000${i}b`;
+    return {
+      zip: makeZip([
+        { name: 'injection.acmd', data: enc(acmdInjection(10, 0, 1, 6000, 5, 3000, 'Std', runDT, tA, tB)) },
+        { name: `${tA}.CH`, data: new Float64Array(10) },
+        { name: `${tB}.CH`, data: new Float64Array(5) },
+        { name: '[Content_Types].xml', data: enc('<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"/>') },
+      ]),
+      tA, tB
+    };
+  };
+  const runs = [
+    { repl: 1, runDT: '2026-07-10T10:15:30.1234567+02:00', utcDT: '2026-07-10T08:15:30.123Z' },
+    { repl: 2, runDT: '2026-07-10T11:00:00.5000000+02:00', utcDT: '2026-07-10T09:00:00.500Z' },
+    { repl: 3, runDT: '2026-07-10T11:45:10.2500000+02:00', utcDT: '2026-07-10T09:45:10.250Z' },
+  ].map((r, i) => ({ ...r, dx: `Run_Std-r00${i + 1}.dx`, ...mkDx(i + 1, r.runDT) }));
+  const committed = healthy ? runs : [runs[0]];
+  const guid = (i) => `abcdef0${i}-0000-4000-8000-00000000000${i}`;
+  const rows = committed.map((r, i) => ({
+    dx: r.dx, guid: guid(i + 1), repl: r.repl, runDT: r.runDT, utcDT: r.utcDT,
+    traceA: r.tA, traceB: r.tB, rx: 'Run_Std-r001.rx'
+  }));
+  const entries = [
+    ...runs.map(r => ({ name: r.dx, data: r.zip })),
+    { name: 'Run_Std-r001.rx', data: makeZip([
+      { name: '[Content_Types].xml', data: enc('<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"/>') },
+      { name: 'Base/InjectionACAML', data: enc(rxInjectionACAML()) },
+    ]) },
+    { name: 'Run.acaml', data: enc(acamlManifest(rows)) },
+    { name: 'Run.mfx', data: enc(filesetManifest(['Run_Std-r001.dx'])) },
+  ];
+  return { buffer: makeZip(entries).buffer, runs };
 }

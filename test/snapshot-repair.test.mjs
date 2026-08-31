@@ -414,3 +414,96 @@ test('repaired olax: snapshot-only manifest promoted (only mode)', async () => {
   assert.ok(!/Path>[^<]*snapshot-/i.test(text), 'promoted: snapshot ref renamed to regular');
   assert.ok(text.includes('<Path>Run_Test.dx</Path>'));
 });
+
+/* --------- commit of acquired-but-uncommitted injections into .acaml ------- */
+
+import { buildCommitOlax } from './fixtures/build-olax.mjs';
+
+async function acamlOf(u8) {
+  const z = app.parseZip(u8);
+  const name = [...z.files.keys()].find((n) => /\.acaml$/i.test(n));
+  const text = new TextDecoder().decode(await app.readZipFile(z, name));
+  return { z, name, text };
+}
+
+test('repaired olax: uncommitted injections get committed to the manifest', async () => {
+  const fx = buildCommitOlax();          // r001 committed, r002/r003 not
+  reset();
+  await app.parseOlax(fx.buffer, 'commit.olax');
+  const u8 = await repairedU8(fx, 'commit.olax');
+  const { z, text } = await acamlOf(u8);
+
+  // All three injections are committed now, each with its own GUID used
+  // consistently as MeasData@id, InjectionMeasData_ID ref and
+  // InjectionMetaData@InjectionId.
+  const imdNames = [...text.matchAll(/RawDataFileName="([^"]*)"/g)].map(m => m[1]);
+  assert.deepEqual(imdNames,
+    ['Run_Std-r001.dx', 'Run_Std-r002.dx', 'Run_Std-r003.dx']);
+  const newGuids = [...text.matchAll(/<InjectionMetaData [^>]*>/g)]
+    .map(m => m[0])
+    .filter(b => /RawDataFileName="Run_Std-r00[23]\.dx"/.test(b))
+    .map(b => (/InjectionId="([0-9a-f-]+)"/.exec(b) || [])[1]);
+  assert.equal(newGuids.length, 2, 'two new injections committed');
+  for (const g of newGuids) {
+    assert.ok(new RegExp(`<MeasData id="${g}"`).test(text), 'MeasData row @ ' + g.slice(0, 8));
+    assert.ok(new RegExp(`<InjectionMeasData_ID id="${g}"`).test(text), 'sample ref @ ' + g.slice(0, 8));
+  }
+
+  // New rows carry the facts from their own injection.acmd: trace IDs,
+  // acquisition time (converted to UTC ms), replicate + order numbers.
+  // They stay in the "acquired, not yet processed" state (no
+  // ExternalResultPath); the originally committed r001 keeps its results.
+  assert.equal((text.match(/<ExternalResultPath>/g) || []).length, 1,
+    'only r001 has processed results');
+  const g2 = newGuids[0];
+  const blk2 = text.slice(text.indexOf(`<MeasData id="${g2}"`));
+  assert.ok(blk2.includes(fx.runs[1].tA) && blk2.includes(fx.runs[1].tB),
+    'r002 signal rows carry r002 trace GUIDs');
+  assert.ok(text.includes('InjectionAcqDateTime="2026-07-10T09:00:00.500Z"'),
+    'acq time converted to UTC ms form');
+  const order2 = /<OrderNo val="(\d+)" \/>/.exec(blk2.slice(0, 4000));
+  assert.equal(order2[1], '2', 'OrderNo follows the replicate number');
+  assert.ok(/<ReplicateNumber val="2" \/>/.test(
+    text.slice(text.indexOf('InjectionId="' + g2 + '"') - 900)), 'ReplicateNumber 2');
+
+  // Manifest stays self-consistent: checksum covers the committed rows.
+  const v = /<Value>([^<]*)<\/Value>/.exec(text)[1];
+  assert.equal(v, app.md5Base64(app.encodeUTF8(app.acamlCanonicalDoc(text))),
+    'checksum self-consistent after commit');
+
+  // Fileset: the .dx files the session never registered are listed with
+  // the MD5 of the bytes actually shipped.
+  const mfxName = [...z.files.keys()].find((n) => /\.mfx$/i.test(n));
+  const mfx = new TextDecoder().decode(await app.readZipFile(z, mfxName));
+  for (const f of ['Run_Std-r002.dx', 'Run_Std-r003.dx']) {
+    const e = new RegExp(`<File Path="${f}" IdentifierAlgorithm="MD5" Identifier="([0-9a-f]{32})"`).exec(mfx);
+    assert.ok(e, 'mfx lists ' + f);
+    const dxName = [...z.files.keys()].find(n => n.endsWith(f));
+    const bytes = await app.readZipFile(z, dxName);
+    assert.equal(e[1], app.md5Hex(bytes), 'mfx MD5 for ' + f);
+  }
+  const acamlId = /<File Path="Run\.acaml" IdentifierAlgorithm="MD5" Identifier="([0-9a-f]{32})"/.exec(mfx);
+  assert.equal(acamlId[1], app.md5Hex(await app.readZipFile(z,
+    [...z.files.keys()].find(n => /\.acaml$/i.test(n)))),
+    'mfx tracks the repaired .acaml bytes');
+});
+
+test('healthy result set: nothing to commit, no output churn', async () => {
+  const fx = buildCommitOlax({ healthy: true });   // all injections committed
+  reset();
+  await app.parseOlax(fx.buffer, 'healthy.olax');
+  assert.equal(await app.olaxHasUncommittedDx(fx.buffer), false,
+    'nothing to commit detected');
+  const outs = await app.buildRepairedOlax(fx.buffer, 'healthy.olax');
+  const { text } = await acamlOf(blobToU8(outs[0].blob));
+  assert.equal((text.match(/<InjectionMetaData /g) || []).length, 3,
+    'still exactly the three committed injections');
+});
+
+test('uncommitted-dx detection gates the repaired download', async () => {
+  const fx = buildCommitOlax();
+  reset();
+  await app.parseOlax(fx.buffer, 'commit.olax');
+  assert.equal(await app.olaxHasUncommittedDx(fx.buffer), true,
+    'r002/r003 detected as uncommitted');
+});

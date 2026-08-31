@@ -49,3 +49,29 @@
        injections / 72 peaks), 3 snapshot rels removed. After task 19: RAD
        acaml fully retargeted (0 snapshot `<Path>`s) with the recomputed
        checksum validated by Agilent's own calculator.
+- [x] 20. Manifest commit: `.dx` files shipped but never registered by an
+       unclosed snapshot session are committed into the `.acaml` manifest —
+       `<InjectionMetaData>`, `Injections/MeasData` (Signal rows derived from
+       the dx's own `injection.acmd` TraceId/DeviceName/ChannelName metadata,
+       only for trace files actually present in the dx) and the sample
+       `InjectionMeasData_ID` link, templated on the last committed sibling
+       of the same sample (SampleName from acmd). No `ExternalResultPath`:
+       the injection is honestly 'acquired, not yet processed' until
+       reprocessed in OpenLab.
+- [x] 21. Package consistency for committed injections: ACAML MD5 `<Checksum>`
+       recomputed over the canonical `<Doc>`; `.mfx` `<File>` entries added
+       for newly registered `.dx` parts with `IdentifierAlgorithm="MD5"`
+       hex digests of the shipped bytes; the acaml's own entry updated to
+       the repaired digest.
+- [x] 22. Fixture `buildCommitOlax` (3 runs, r001 committed, r002/r003
+       acquired-only) + 3 tests: commit correctness (GUID reused across all
+       three record types, acq time UTC-ms conversion, replicate/order
+       numbers, trace GUID wiring, checksum self-consistency, mfx digests),
+       healthy no-op (all committed -> unchanged manifest), and uncommitted
+       detection. 57/57 green.
+- [x] 23. Real-file proof on the RAD archive: repaired `.olax` lists 22
+       injections (7 committed + 15 recovered) with 0 snapshot refs; verified
+       with Agilent's own `MD5ChecksumCalculatorV1` (checksum VALID) and the
+       Agilent ACAML object model (22 MeasData rows, 22 InjectionMetaData
+       items deserialize cleanly); our own parser still reports 22/22
+       measurements on the repaired archive.

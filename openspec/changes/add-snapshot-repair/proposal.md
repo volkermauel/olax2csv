@@ -34,10 +34,29 @@ processed results exist only as `snapshot-…r005.rx` (snapshot `.dx` is a parti
   changes in CSV/XLSX output; recovered measurements look native.
 - Fixture builder supports `snapshot: 'none' | 'only' | 'duplicate' | 'rxOnly'`;
   new test suite `test/snapshot-repair.test.mjs` (6 tests).
+- The repaired download additionally **commits acquired-but-uncommitted
+  injections** into the `.acaml` manifest: a session closed as 'snapshot'
+  can ship `.dx` files that were never registered. For each such `.dx`
+  the repair derives an `<InjectionMetaData>` entry, an
+  `Injections/MeasData` row (Signal rows from the dx's own
+  `injection.acmd` trace metadata) and the sample `InjectionMeasData_ID`
+  link from the last committed injection of the same sample; no
+  `ExternalResultPath` is written (the injection stays in its honest
+  'acquired, not yet processed' state until reprocessed in OpenLab).
+  The ACAML MD5 checksum is recomputed and the `.mfx` fileset gains the
+  MD5 `File` entries for the newly registered parts.
+- Fixture builder grows `buildCommitOlax` (3 runs, only the first
+  committed) with 3 more tests; 57/57 green.
 
 ## Impact
 
 Affected specs: `resultset-parsing` (RS-2 refined, RS-3 added).
 Risk: recovery only fires when the completed counterpart is missing, so
 well-formed exports parse exactly as before (verified: all 41 tests green and
-the Berlin `.olax` sample byte-identical output counts).
+the Berlin `.olax` sample byte-identical output counts). For the manifest
+commit: records are synthesized only from data each `.dx` itself carries
+(times, sample name, trace IDs) plus committed siblings as templates — no
+result values are invented, and result sets whose injections are all
+committed emit an unchanged manifest (proven by Agilent's own checksum
+calculator and object-model deserialization on the repaired RAD archive:
+22 injections, 7 with results).

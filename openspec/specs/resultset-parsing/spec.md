@@ -51,6 +51,22 @@ acquired measurements:
   `.acaml` MD5 `<Checksum>` SHALL be recomputed over the canonical
   re-serialization of the edited `<Doc>` subtree. When the stored checksum
   algorithm is not MD5, the manifest SHALL be left byte-identical.
+- RS-3.10: the repaired .olax SHALL commit acquired-but-uncommitted
+  injections into the `.acaml` manifest: a `.dx` part shipped in the
+  package but referenced by no `InjectionMetaData` entry is given an
+  `<InjectionMetaData>` record, an `Injections/MeasData` row (Signal rows
+  derived from the dx's own `injection.acmd` trace metadata, restricted to
+  trace files actually present in the dx) and the sample-row
+  `InjectionMeasData_ID` link, using the last committed injection of the
+  same sample as the template for method/container references. Facts come
+  from the dx itself (acquisition time, sample name, replicate number);
+  times are converted to the UTC millisecond form. No `ExternalResultPath`
+  is written — the injection keeps its honest 'acquired, not yet
+  processed' state until reprocessed in OpenLab. The MD5 checksum is
+  recomputed, and the `.mfx` fileset gains `<File>` entries (MD5 hex
+  digest of the shipped bytes) for every newly registered part, with the
+  `.acaml` entry updated to the repaired digest. When all injections are
+  already committed the manifest SHALL be byte-identical.
 
 ### RS-4: Results extraction
 
