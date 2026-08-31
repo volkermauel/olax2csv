@@ -24,7 +24,9 @@ jobs:
         run: |
           set -e
           if git ls-files | grep -iE '\.(olax|zip|rar|7z)$|^\.pi/'; then
-            echo "::error::Refusing to build: tracked OpenLab data export (.olax/.zip/.rar/.7z = sample/patient PII) or .pi/ files detected"
+            echo "::error::Refusing to build: tracked OpenLab data export"
+            echo "(.olax/.zip/.rar/.7z = sample/patient PII)"
+            echo "or .pi/ files detected"
             exit 1
           fi
           echo "OK: no .olax/.zip/.rar/.7z or .pi/ files are tracked."
@@ -48,3 +50,35 @@ jobs:
         run: npm ci
       - name: Run tests
         run: npm test
+
+  # Deploy the stamped single-file app to GitHub Pages. The repo keeps clean
+  # __COMMIT__/__BUILT__ placeholders; only the published artifact carries the
+  # real values (local file use shows no badge instead of stale info).
+  deploy:
+    name: Deploy to GitHub Pages
+    needs: test
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+      contents: read
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v5
+      - name: Stamp build info
+        run: |
+          set -e
+          sha="${GITHUB_SHA::7}"
+          ts="$(date -u '+%Y-%m-%d %H:%M UTC')"
+          sed -i "s/__COMMIT__/$sha/" index.html
+          sed -i "s/__BUILT__/$ts/" index.html
+          grep -q "$sha" index.html   # sanity: tokens really replaced
+          echo "stamped $sha / $ts"
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: .
+      - id: deployment
+        uses: actions/deploy-pages@v4

@@ -7,6 +7,9 @@
   <style>
     body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 18px; }
     h1 { font-size: 18px; margin: 0 0 10px; }
+    .buildInfo { font-size: 12px; font-weight: normal; color: #999; margin-left: 12px; white-space: nowrap; }
+    .buildInfo a { color: inherit; text-decoration: none; }
+    .buildInfo a:hover { text-decoration: underline; }
     .row { display: flex; gap: 12px; flex-wrap: wrap; align-items: center; }
     .card { border: 1px solid #ddd; border-radius: 10px; padding: 12px; margin: 12px 0; }
     button { padding: 8px 12px; border-radius: 8px; border: 1px solid #ccc; background: #f7f7f7; cursor: pointer; }
@@ -27,6 +30,7 @@
   </style>
 </head>
 <body>
+  <h1>OpenLab CDS .OLAX → CSV / XLSX (single HTML)<span id="buildInfo" class="buildInfo" hidden></span></h1>
 
   <div class="card">
     <div class="row">
@@ -2361,6 +2365,16 @@ logln("Ready.");
 // Build stamp: the deploy pipeline replaces these tokens (short commit SHA +
 // UTC build time). With the raw placeholders (local file, tests) the badge
 // stays hidden.
+const BUILD = { commit: "__COMMIT__", built: "__BUILT__" };
+(function renderBuildInfo() {
+  const el = typeof document !== "undefined" && document.getElementById("buildInfo");
+  if (!el || !/^[0-9a-f]{7,40}$/.test(BUILD.commit)) return;
+  const a = document.createElement("a");
+  a.href = "https://github.com/volkermauel/olax2csv/commit/" + BUILD.commit;
+  a.textContent = BUILD.commit.slice(0, 7);
+  el.append(a, " \u00b7 built " + (BUILD.built || "unknown"));
+  el.hidden = false;
+})();
 </script>
 
 <!-- SheetJS Community Edition (xlsx) — embedded for offline single-file use -->
