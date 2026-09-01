@@ -39,8 +39,8 @@ export function makeZip(entries) {
   for (const e of entries) {
     const nameBytes = enc.encode(e.name);
     const data = e.data;
-    const comp = zlib.deflateRawSync(data);   // raw DEFLATE -> app reads via "deflate-raw"
-    const method = 8;
+    const method = e.method ?? 8;               // 8 = deflate (default), 0 = store
+    const comp = method === 0 ? data : zlib.deflateRawSync(data); // raw DEFLATE -> app reads via "deflate-raw"
     const crc = crc32(data);
 
     const lfh = [
@@ -127,7 +127,7 @@ ${inj}
 }
 
 export function acmdInjection(N1, min1, max1, tEnd1, N2, tEnd2, sampleName,
-  runDT = '2026-07-10T10:00:00.0000000+02:00', traceA = TRACE1, traceB = TRACE2) {
+  runDT = '2026-07-10T10:00:00.0000000+02:00', traceA = TRACE1, traceB = TRACE2, slopeA = 1, slopeB = 1) {
   return `<?xml version="1.0" encoding="utf-8"?>
 <Injection xmlns="urn:schemas-agilent-com:acmd20">${sampleName ? `\n  <SampleName>${sampleName}</SampleName>` : ''}
   <RunDateTime>${runDT}</RunDateTime>
@@ -143,7 +143,7 @@ export function acmdInjection(N1, min1, max1, tEnd1, N2, tEnd2, sampleName,
     <TimeEnd>${tEnd1}</TimeEnd>
     <Minimum>${min1}</Minimum>
     <Maximum>${max1}</Maximum>
-    <Slope>1</Slope>
+    <Slope>${slopeA}</Slope>
   </Signal>
   <Signal>
     <TraceId>${traceB}</TraceId>
@@ -157,7 +157,7 @@ export function acmdInjection(N1, min1, max1, tEnd1, N2, tEnd2, sampleName,
     <TimeEnd>${tEnd2}</TimeEnd>
     <Minimum>0</Minimum>
     <Maximum>0</Maximum>
-    <Slope>1</Slope>
+    <Slope>${slopeB}</Slope>
   </Signal>
 </Injection>`;
 }

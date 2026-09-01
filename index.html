@@ -387,80 +387,157 @@ function sampleNameFromDxPath(dxPath) {
 }
 
 /* ============================
-   Raw trace extraction (unchanged)
+   Raw trace extraction
    ============================ */
 
-function align8(u8) {
-  // Zip entries can be zero-copy subarray views at any byte offset; float64
-  // access needs an 8-aligned start. Trim the view (never copy) so the
-  // alignment invariant holds for every caller.
-  const rem = u8.byteOffset % 8;
-  if (rem === 0) return u8;
-  const drop = 8 - rem;
-  return u8.byteLength > drop ? u8.subarray(drop) : new Uint8Array(0);
+function f64Copy(dv, byteOff, n) {
+  // n float64 values from an arbitrary byte offset, as a standalone aligned
+  // array. DataView reads need no alignment (Float64Array views do), so this
+  // is the only safe way to hand callers a window found at an odd offset.
+  const out = new Float64Array(n);
+  for (let i = 0; i < n; i++) out[i] = dv.getFloat64(byteOff + i * 8, true);
+  return out;
 }
 
 function f64Of(u8, n) {
-  const a = align8(u8);
-  return new Float64Array(a.buffer, a.byteOffset, n);
+  // First n float64 values from byte 0 of the view. Last-resort fallback
+  // only — byte 0 is the .CH header; buildCSVForTrace warns when it is used.
+  const dv = new DataView(u8.buffer, u8.byteOffset, u8.byteLength);
+  return f64Copy(dv, 0, n);
+}
+
+/*
+ Locate the Y-value region of an Agilent "179" .CH trace (Signal179 2D
+ chromatogram) from the file's own header instead of heuristics. Layout
+ validated against every trace of a real Content-Manager .rslt.zip and a
+ real .olax export, and cross-checked against OpenLab's own reader
+ implementation (the layout facts below reproduce its reads exactly):
+   byte 0      0x03, bytes 1-3 ASCII "179"
+   @282/@286   StartTime/EndTime    BE float32, ms
+   @290/@294   MaxSignal/MinSignal  BE float32, raw counts (can be stale 0)
+   @4110       Zero1 = valuesY[0]   BE float32
+   @4732       Slope                BE float64
+   values      little-endian float64. ChemStation-legacy writers start at
+               6136 (file = 6136 + n*8 values + 8 tail bytes); the
+               OpenLab-native variant starts at 6144. The acmd slope,
+               end time and first value anchor the choice; the acmd
+               min/max are deliberately NOT trusted (real exports carry
+               garbage extrema there, e.g. 1.59e-98 maxima).
+ Returns the value-region byte offset, or null when the header does not
+ validate (caller falls back to window scanning).
+*/
+function ch179DataOffset(dv, n, slope, timeEnd) {
+  if (n <= 0 || dv.byteLength < 6144 + n * 8) return null;
+  if (dv.getUint8(0) !== 0x03) return null;
+  if (String.fromCharCode(dv.getUint8(1), dv.getUint8(2), dv.getUint8(3)) !== "179") return null;
+  if (Math.abs(dv.getFloat64(4732, false) - slope) > 1e-9 * Math.max(1, Math.abs(slope))) return null;
+  if (Number.isFinite(timeEnd) &&
+      Math.abs(dv.getFloat32(286, false) - timeEnd) > Math.max(2, 1e-3 * Math.abs(timeEnd))) return null;
+  const zero1 = dv.getFloat32(4110, false);
+  for (const off of [6136, 6144]) {
+    if (off + n * 8 > dv.byteLength) continue;
+    const v0 = dv.getFloat64(off, true);
+    if (Math.abs(zero1 - v0) <= 1e-5 * Math.abs(v0) + 1e-6) return off;
+  }
+  return null;
 }
 
 function bestFloatSegment(u8, n, slope, expMin, expMax) {
-  // Try float64 segments at 8-byte aligned offsets.
+  // A .CH payload can start at ANY byte offset: zip entries arrive as
+  // zero-copy views at arbitrary alignment, and the in-file data start has
+  // no 8-alignment guarantee either. Every byte offset is probed via
+  // DataView (alignment-free) — scanning only offsets 8-aligned to the
+  // view's backing buffer silently misses the data whenever the two
+  // alignments disagree, which is what happens on real Content-Manager
+  // .rslt.zip and .olax exports.
+  //
+  // Candidates are evaluated with a sliding window per byte-alignment
+  // residue class (monotonic min/max deques + counters), so each candidate
+  // costs O(1) amortized. A naive per-candidate scan is O(file × n) and
+  // takes minutes on real exports, because near-zero baselines never trip
+  // any early abort.
   const minTol = Math.max(50, 0.05 * Math.abs(expMin || 0));
   const maxTol = Math.max(10, 0.02 * Math.abs(expMax || 0));
+  const dv = new DataView(u8.buffer, u8.byteOffset, u8.byteLength);
+  const len = u8.byteLength;
+  if (n <= 0 || len < n * 8) return null;
+
   let best = null;
 
-  u8 = align8(u8);
-  const buf = u8.buffer;
-  const base = u8.byteOffset;
-  const limit = u8.byteLength - n * 8;
-  for (let off = 0; off <= limit; off += 8) {
-    let arr;
-    try {
-      arr = new Float64Array(buf, base + off, n);
-    } catch (_) { continue; }
+  for (let residue = 0; residue < 8; residue++) {
+    const slots = Math.floor((len - residue - 8) / 8) + 1; // f64 positions at this residue
+    if (slots < n) continue;
+    const lastStart = slots - n;
 
-    let mn = Infinity, mx = -Infinity, maxAbs = 0, zeros = 0, lead = 0;
-    let seenNonZero = false;
+    // Monotonic deques as parallel index/value arrays with head cursors
+    // (no shift()): maxV is decreasing, minV increasing from head to tail.
+    const maxI = [], maxV = [], minI = [], minV = [];
+    let hMax = 0, hMin = 0;
+    let bad = 0, zeros = 0;             // in-window counters
+    const isNonzero = new Uint8Array(slots);
+    let nz = 0;                          // first nonzero slot >= window start
+    let k = 0;                           // next slot to admit
 
-    for (let i = 0; i < n; i++) {
-      const v = arr[i];
-      if (!Number.isFinite(v)) { mn = NaN; break; }
-      if (v === 0) zeros++;
-      if (!seenNonZero) { if (v !== 0) { seenNonZero = true; } else { lead++; } }
-      if (v < mn) mn = v;
-      if (v > mx) mx = v;
-      const av = Math.abs(v);
-      if (av > maxAbs) maxAbs = av;
+    for (let start = 0; start <= lastStart; start++) {
+      for (; k < start + n; k++) {
+        const v = dv.getFloat64(residue + k * 8, true);
+        if (!Number.isFinite(v) || v > 1e12 || v < -1e12) { bad++; continue; } // header garbage
+        if (v === 0) zeros++; else isNonzero[k] = 1;
+        while (maxI.length > hMax && maxV[maxI.length - 1] <= v) { maxI.pop(); maxV.pop(); }
+        maxI.push(k); maxV.push(v);
+        while (minI.length > hMin && minV[minI.length - 1] >= v) { minI.pop(); minV.pop(); }
+        minI.push(k); minV.push(v);
+      }
+      while (hMax < maxI.length && maxI[hMax] < start) hMax++;
+      while (hMin < minI.length && minI[hMin] < start) hMin++;
+
+      if (bad === 0) {
+        const smx = maxV[hMax] * slope;
+        const smn = minV[hMin] * slope;
+        if (Math.abs(smx - expMax) <= maxTol && Math.abs(smn - expMin) <= minTol) {
+          // lead = leading zeros of the window (score tiebreaker)
+          while (nz < start) nz++;
+          while (nz < start + n && !isNonzero[nz]) nz++;
+          const lead = Math.min(nz, start + n) - start;
+          const score = Math.abs(smn - expMin) + Math.abs(smx - expMax) + 0.01 * zeros + 0.001 * lead;
+          if (!best || score < best.score) best = { score, off: residue + start * 8 };
+        }
+      }
+
+      // window slides: slot `start` leaves
+      const out = dv.getFloat64(residue + start * 8, true);
+      if (!Number.isFinite(out) || out > 1e12 || out < -1e12) bad--;
+      else if (out === 0) zeros--;
     }
-    if (!Number.isFinite(mn) || maxAbs > 1e12) continue;
-
-    const smn = mn * slope;
-    const smx = mx * slope;
-
-    if (Math.abs(smx - expMax) > maxTol) continue;
-    if (Math.abs(smn - expMin) > minTol) continue;
-
-    const score = Math.abs(smn - expMin) + Math.abs(smx - expMax) + 0.01 * zeros + 0.001 * lead;
-    if (!best || score < best.score) best = { score, off, arr };
   }
-  return best; // {off, arr}
+  return best ? { off: best.off, arr: f64Copy(dv, best.off, n) } : null;
 }
 
 function findAllZeroSegment(u8, n) {
-  u8 = align8(u8);
-  const buf = u8.buffer;
-  const base = u8.byteOffset;
-  const limit = u8.byteLength - n * 8;
-  for (let off = 0; off <= limit; off += 8) {
-    let arr;
-    try { arr = new Float64Array(buf, base + off, n); } catch (_) { continue; }
-    let ok = true;
-    for (let i = 0; i < n; i++) { if (arr[i] !== 0) { ok = false; break; } }
-    if (ok) return { off, arr };
+  // Byte-wise earliest all-zero window: an all-zero run can begin at any
+  // alignment. Sliding zero-count per residue class keeps it O(file).
+  const dv = new DataView(u8.buffer, u8.byteOffset, u8.byteLength);
+  const len = u8.byteLength;
+  if (n <= 0 || len < n * 8) return null;
+
+  let bestOff = -1;
+  for (let residue = 0; residue < 8; residue++) {
+    const slots = Math.floor((len - residue - 8) / 8) + 1;
+    if (slots < n) continue;
+    let zeros = 0, k = 0;
+    for (let start = 0; start + n <= slots; start++) {
+      for (; k < start + n; k++) {
+        if (dv.getFloat64(residue + k * 8, true) === 0) zeros++;
+      }
+      if (zeros === n) {
+        const off = residue + start * 8;
+        if (bestOff < 0 || off < bestOff) bestOff = off;
+        break; // earliest window of this residue class
+      }
+      if (dv.getFloat64(residue + start * 8, true) === 0) zeros--;
+    }
   }
-  return null;
+  return bestOff >= 0 ? { off: bestOff, arr: new Float64Array(n) } : null; // all zeros by construction
 }
 
 function makeCSV(trace, y) {
@@ -823,13 +900,23 @@ async function buildCSVForTrace(t) {
   const chBytes = await readZipFile(t.dxZip, chName);
 
   let seg = null;
-  if (Math.abs(t.min - t.max) < 1e-12 && Math.abs(t.max) < 1e-12) {
+  const chDv = new DataView(chBytes.buffer, chBytes.byteOffset, chBytes.byteLength);
+  const hdrOff = ch179DataOffset(chDv, t.n, t.slope, t.timeEnd);
+  if (hdrOff != null) {
+    // Format-driven path: the .CH header itself tells us where the
+    // little-endian float64 values live. Immune to the garbage acmd
+    // min/max seen in real exports.
+    seg = { off: hdrOff, arr: f64Copy(chDv, hdrOff, t.n) };
+  } else if (Math.abs(t.min - t.max) < 1e-12 && Math.abs(t.max) < 1e-12) {
     seg = findAllZeroSegment(chBytes, t.n);
-    if (!seg) seg = { off: 0, arr: f64Of(chBytes, t.n) };
+    if (!seg) {
+      logln(`  ⚠ ${t.csvName || t.traceId}: no all-zero float64 window found — emitting raw first ${t.n} values (.CH header likely included)`);
+      seg = { off: 0, arr: f64Of(chBytes, t.n) };
+    }
   } else {
     seg = bestFloatSegment(chBytes, t.n, t.slope, t.min, t.max);
     if (!seg) {
-      // fallback: first float64 block
+      logln(`  ⚠ ${t.csvName || t.traceId}: no float64 window matches the .acmd min/max — emitting raw first ${t.n} values (.CH header likely included)`);
       seg = { off: 0, arr: f64Of(chBytes, t.n) };
     }
   }

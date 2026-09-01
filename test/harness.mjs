@@ -28,6 +28,7 @@ const APP_CODE = m[1] + [
   ';globalThis.PEAK_HEADER = PEAK_HEADER; globalThis.COMPOUND_HEADER = COMPOUND_HEADER; globalThis.CALIB_HEADER = CALIB_HEADER; globalThis.INJ_HEADER = INJ_HEADER;',
   // Worker machinery — the worker tests compose the REAL worker source from these.
   ';globalThis.parseZip = parseZip; globalThis.groupByRslt = groupByRslt; globalThis.getFileSlice = getFileSlice; globalThis.buildWorkerSource = buildWorkerSource; globalThis.buildWorkerMessage = buildWorkerMessage; globalThis.parseContainerParallel = parseContainerParallel; globalThis.WORKER_FNS = WORKER_FNS;',
+  ';globalThis.bestFloatSegment = bestFloatSegment; globalThis.findAllZeroSegment = findAllZeroSegment; globalThis.f64Of = f64Of; globalThis.ch179DataOffset = ch179DataOffset; globalThis.f64Copy = f64Copy;',
 ].join('\n');
 
 // xmldom has no querySelector; the app uses doc.querySelector("parsererror").
