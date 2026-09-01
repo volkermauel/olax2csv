@@ -144,3 +144,11 @@
        archives and native .olax inputs round-trip. 71/71 green; all
        variants pass Agilent AcamlChecksum.VerifyStream and open under
        System.IO.Packaging.
+- [x] 32. Full wrapper parity with a native CMC export of the same result
+       set (RAD-export-openlab.olax): entry order is acaml, _rels/.rels,
+       mfx, sqx, dx/rx pairs, amx, scml, psmdcp, [Content_Types].xml;
+       [Content_Types].xml default order mirrors that entry order;
+       psmdcp carries category, dc:creator, dcterms:created, revision
+       (build-time, local offset), version, dc:title in native order with
+       the UTF-8 BOM. Confirmed structurally against the native export;
+       71/71 green; plain variant passes VerifyStream and Package.Open.

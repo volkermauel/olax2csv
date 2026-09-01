@@ -1966,6 +1966,15 @@ async function buildRepairedOlax(arrayBuffer, containerName, variant = "") {
       const title = newFolder || g.folderName || stem + ".rslt";
       const coreName = "package/services/metadata/core-properties/" +
         md5Hex(encodeUTF8(title)) + ".psmdcp";
+      // Field order and revision mirror native exports (category, creator,
+      // created, revision, version, title); native psmdcp carries no BOM.
+      const now = new Date();
+      const frac = String(now.getMilliseconds()).padStart(3, "0") + "0000";
+      const tzo = -now.getTimezoneOffset();
+      const off = (tzo < 0 ? "-" : "+") +
+        String(Math.floor(Math.abs(tzo) / 60)).padStart(2, "0") + ":" +
+        String(Math.abs(tzo) % 60).padStart(2, "0");
+      const revision = now.toISOString().replace("Z", "").replace(/\.\d+/, "." + frac) + off;
       const coreProps =
         "\ufeff<?xml version=\"1.0\" encoding=\"utf-8\"?>" +
         "<coreProperties xmlns:dc=\"http://purl.org/dc/elements/1.1/\" " +
@@ -1975,8 +1984,9 @@ async function buildRepairedOlax(arrayBuffer, containerName, variant = "") {
         "<category>Agilent OpenLab Archive File</category>" +
         (creator ? `<dc:creator>${xmlEscVal(xmlUnesc(creator[1]))}</dc:creator>` : "") +
         (created ? `<dcterms:created xsi:type=\"dcterms:W3CDTF\">${created[1]}</dcterms:created>` : "") +
-        `<dc:title>${xmlEscVal(title)}</dc:title>` +
-        "<version>1.1</version></coreProperties>";
+        `<revision>${revision}</revision>` +
+        "<version>1.1</version>" +
+        `<dc:title>${xmlEscVal(title)}</dc:title></coreProperties>`;
       // Data-part relationships first, core-properties last (native order).
       const relId = () => {
         const b = new Uint8Array(8);
@@ -1992,18 +2002,33 @@ async function buildRepairedOlax(arrayBuffer, containerName, variant = "") {
         "</Relationships>";
       files.push({ name: "_rels/.rels", data: encodeUTF8(rels), store: true });
       files.push({ name: coreName, data: encodeUTF8(coreProps), store: true });
-      const exts = new Set(files
-        .map(f => f.name.split(".").pop().toLowerCase())
-        .filter(ext => ext !== "rels" && ext !== "psmdcp" && ext !== "xml"));
-      let ct = "\ufeff<?xml version=\"1.0\" encoding=\"utf-8\"?>" +
-        "<Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\">";
-      for (const ext of exts)
-        ct += `<Default Extension=\"${ext}\" ContentType=\"Agilent.OpenLab.Archive/ArchiveFile\"/>`;
-      ct += "<Default Extension=\"rels\" ContentType=\"application/vnd.openxmlformats-package.relationships+xml\"/>" +
-        "<Default Extension=\"psmdcp\" ContentType=\"application/vnd.openxmlformats-package.core-properties+xml\"/>";
-      files.push({ name: "[Content_Types].xml", data: encodeUTF8(ct + "</Types>"), store: true });
+      files.push({ name: "[Content_Types].xml", data: encodeUTF8(""), store: true, ctPlaceholder: true });
     }
     if (hasWrapper) for (const w of wrapperFiles) files.push({ ...w, store: true });
+    // Native entry order: the manifest leads, relationship part second,
+    // mfx/sqx next, remaining data parts, psmdcp, [Content_Types].xml last.
+    const rank = n => /\.acaml$/i.test(n) ? 0 : n === "_rels/.rels" ? 1
+      : /\.mfx$/i.test(n) ? 2 : /\.sqx$/i.test(n) ? 3
+      : /\.dx$/i.test(n) ? 4 : /\.rx$/i.test(n) ? 4.1
+      : /\.amx$/i.test(n) ? 4.5 : /\.scml$/i.test(n) ? 4.6
+      : n === "[Content_Types].xml" ? 6 : /\.psmdcp$/i.test(n) ? 5 : 4.3;
+    files.sort((a, b) => rank(a.name) - rank(b.name));
+    // [Content_Types].xml default order mirrors the final entry order
+    // (first data extension, rels, remaining extensions, psmdcp last).
+    const ctIdx = files.findIndex(f => f.ctPlaceholder);
+    if (ctIdx >= 0) {
+      const exts = [...new Set(files
+        .map(f => f.name.split(".").pop().toLowerCase())
+        .filter(ext => ext !== "rels" && ext !== "psmdcp" && ext !== "xml"))];
+      let ct = "\ufeff<?xml version=\"1.0\" encoding=\"utf-8\"?>" +
+        "<Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\">";
+      if (exts.length) ct += `<Default Extension=\"${exts[0]}\" ContentType=\"Agilent.OpenLab.Archive/ArchiveFile\"/>`;
+      ct += "<Default Extension=\"rels\" ContentType=\"application/vnd.openxmlformats-package.relationships+xml\"/>";
+      for (const ext of exts.slice(1))
+        ct += `<Default Extension=\"${ext}\" ContentType=\"Agilent.OpenLab.Archive/ArchiveFile\"/>`;
+      ct += "<Default Extension=\"psmdcp\" ContentType=\"application/vnd.openxmlformats-package.core-properties+xml\"/>";
+      files[ctIdx] = { name: "[Content_Types].xml", data: encodeUTF8(ct + "</Types>"), store: true };
+    }
     const tag = variant ? "-" + variant : "";
     outputs.push({
       name: groups.length === 1

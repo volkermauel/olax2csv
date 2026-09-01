@@ -680,10 +680,21 @@ test('repaired wrapper carries native-shaped package core properties', async () 
   const order = [...rels.matchAll(/Target="([^"]*)"/g)].map(m => m[1]);
   assert.equal(order[order.length - 1], '/' + core,
     'core-properties relationship comes last (native order)');
-  const coreXml = new TextDecoder().decode(await app.readZipFile(z, core));
+  const coreBytes = await app.readZipFile(z, core);
+  const coreXml = new TextDecoder().decode(coreBytes);
+  assert.ok(coreBytes[0] === 0xef && coreBytes[1] === 0xbb && coreBytes[2] === 0xbf,
+    'psmdcp carries the UTF-8 BOM like native exports');
   assert.match(coreXml, /<category>Agilent OpenLab Archive File<\/category>/);
   assert.match(coreXml, /<dc:title>[^<]*\.rslt<\/dc:title>/);
   assert.match(coreXml, /<dc:creator>/, 'creator from the manifest DocInfo');
+  assert.match(coreXml, /<revision>\d{4}-\d{2}-\d{2}T[\d:.]+[+-]\d{2}:\d{2}<\/revision>/,
+    'revision timestamp (native field)');
+  assert.ok(coreXml.indexOf('<category>') < coreXml.indexOf('<dc:creator>') &&
+    coreXml.indexOf('<dc:creator>') < coreXml.indexOf('<dcterms:created') &&
+    coreXml.indexOf('<dcterms:created') < coreXml.indexOf('<revision>') &&
+    coreXml.indexOf('<revision>') < coreXml.indexOf('<version>') &&
+    coreXml.indexOf('<version>') < coreXml.indexOf('<dc:title>'),
+    'native field order: category, creator, created, revision, version, title');
   assert.match(coreXml, /<dcterms:created xsi:type="dcterms:W3CDTF">/,
     'creation date from the manifest DocInfo');
 });
