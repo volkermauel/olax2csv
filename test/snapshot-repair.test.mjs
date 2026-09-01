@@ -781,3 +781,28 @@ test('repaired result set carries its own name (no import collisions)', async ()
   assert.match(coreXml, /<dc:title>commit-repaired\.rslt<\/dc:title>/,
     'core-properties title follows the folder');
 });
+
+test('agifile variant: acaml in the native writer byte shape', async () => {
+  // BOM + LF line endings + tab-indented <Checksum> block, content and
+  // checksum value untouched — the shape the native ACAML writer emits.
+  const fx = buildOlax({ snapshot: 'duplicate', withRx: true });
+  reset();
+  await app.parseOlax(fx.buffer, 'agifile-src.olax');
+  const outs = await app.buildRepairedOlax(fx.buffer, 'agifile-src.olax', 'agifile');
+  const z = app.parseZip(blobToU8(outs[0].blob));
+  const acamlN = [...z.files.keys()].find(n => /\.acaml$/i.test(n));
+  const bytes = await app.readZipFile(z, acamlN);
+  assert.ok(bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf,
+    'UTF-8 BOM present');
+  const text = new TextDecoder('utf-8', { ignoreBOM: true }).decode(bytes).slice(1);
+  assert.ok(!text.includes('\r'), 'LF line endings only');
+  const ck = /\n\t<Checksum Algorithm="MD5">\n\t\t(<Value>[^<]*<\/Value>)\n\t<\/Checksum>/.exec(text);
+  assert.ok(ck, 'tab-indented checksum block');
+  // checksum value still verifies against the canonical <Doc> preimage
+  assert.equal(/<Value>([^<]*)<\/Value>/.exec(ck[1])[1],
+    app.md5Base64(app.encodeUTF8(app.acamlCanonicalDoc(text))),
+    'checksum self-consistent in writer form');
+  // only the checksum block uses tabs (matches native writer output)
+  assert.ok(!/^\t</m.test(text.replace(/\n\t<Checksum Algorithm="MD5">[\s\S]*?\n\t<\/Checksum>/, '')),
+    'no other tab-indented elements');
+});

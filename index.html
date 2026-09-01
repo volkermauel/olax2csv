@@ -1402,6 +1402,23 @@ function repairAcamlManifest(bytes, withinMap, recs, opts) {
    run whose processing has not happened yet. Reprocessing in OpenLab
    then produces real results. */
 
+// Byte shape the native ACAML writer emits (canonical-form observation of
+// System.IO.Packaging-era CDS files): UTF-8 BOM, LF line endings, and the
+// <Checksum> subtree tab-indented while the rest keeps its 2-space indent.
+// Content and checksum value are untouched.
+function agilentWriterForm(bytes) {
+  let text = decodeUTF8(bytes).replace(/\r\n/g, "\n");
+  const m = /(\s*)<Checksum Algorithm="MD5">\s*(<Value>[^<]*<\/Value>)\s*<\/Checksum>/.exec(text);
+  if (m)
+    text = text.slice(0, m.index) + "\n\t<Checksum Algorithm=\"MD5\">\n\t\t" + m[2] +
+      "\n\t</Checksum>" + text.slice(m.index + m[0].length);
+  const body = encodeUTF8(text);
+  const out = new Uint8Array(body.length + 3);
+  out[0] = 0xef; out[1] = 0xbb; out[2] = 0xbf; // UTF-8 BOM
+  out.set(body, 3);
+  return out;
+}
+
 function newGuid() {
   const b = new Uint8Array(16);
   if (typeof crypto !== "undefined" && crypto.getRandomValues)
@@ -1843,14 +1860,16 @@ async function buildRepairedOlax(arrayBuffer, containerName, variant = "") {
     const recs = variant === "nocommit"
       ? [] : await computeCommitRecords(outer, entries, withinMap);
     const acamlE = entries.find(e => /\.acaml$/i.test(e.finalName));
-    const acamlFinal = variant !== "origacaml" && acamlE &&
+    let acamlBytes = variant !== "origacaml" && acamlE &&
       (withinMap.length || recs.length || variant === "freshid" ||
-        newStem != null) ? {
-      name: acamlE.within,
-      data: repairAcamlManifest(
-        await readZipFile(outer, acamlE.name), withinMap, recs,
-        { freshDocId: variant === "freshid", description: newStem })
-    } : null;
+        newStem != null)
+      ? repairAcamlManifest(
+          await readZipFile(outer, acamlE.name), withinMap, recs,
+          { freshDocId: variant === "freshid", description: newStem })
+      : null;
+    if (acamlBytes && variant === "agifile")
+      acamlBytes = agilentWriterForm(acamlBytes);
+    const acamlFinal = acamlBytes && acamlE ? { name: acamlE.within, data: acamlBytes } : null;
     if (recs.length)
       logln(`  ${g.folderName || stem}: committing ${recs.length} acquired-but-` +
         `uncommitted injection(s) into the manifest.`);
@@ -2523,7 +2542,7 @@ logln("Ready.");
 // UTC build time). With the raw placeholders (local file, tests) the badge
 // stays hidden.
 const BUILD = { commit: "__COMMIT__", built: "__BUILT__" };
-// Temporary import-bisection switch: ?variant=nocommit|origacaml|freshid.
+// Temporary import-bisection switch: ?variant=nocommit|origacaml|freshid|agifile.
 const REPAIR_VARIANT =
   typeof location !== "undefined" &&
     new URLSearchParams(location.search).get("variant") || "";

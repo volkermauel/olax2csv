@@ -129,3 +129,8 @@
        once (`align8`/`f64Of`) instead of crashing; regression test drives
        both the all-zero and gaussian paths through deliberately unaligned
        views.
+- [x] 30. `agifile` import-bisection variant: acaml bytes in the native
+       writer shape (UTF-8 BOM, LF endings, tab-indented `<Checksum>`
+       block; content and checksum value untouched — the shape
+       `AcamlConvert.WriteToStream` emits). Verified against the Agilent
+       assembly on the real RAD archive; 70/70 green.
