@@ -734,6 +734,50 @@ test('variant origacaml: manifest ships byte-identically', async () => {
     app.md5Hex(inBytes), 'acaml untouched');
 });
 
+test('variant keepall: original fileset and names, only manifest rows added', async () => {
+  // Single-variable probe against a native export: every part ships
+  // byte-identically under its original name — snapshot files kept, folder
+  // NOT renamed, .mfx untouched except the manifest identifier — and the
+  // manifest gains only the missing injection rows.
+  const fx = buildCommitOlax();
+  const zin = app.parseZip(new Uint8Array(fx.buffer));
+  const inMfx = [...zin.files.keys()].find(n => /\.mfx$/i.test(n));
+  const inMfxBytes = await app.readZipFile(zin, inMfx);
+  reset();
+  await app.parseOlax(fx.buffer, 'commit.olax');
+  const outs = await app.buildRepairedOlax(fx.buffer, 'commit.olax', 'keepall');
+  const z = app.parseZip(await blobToU8(outs[0].blob));
+  const names = [...z.files.keys()];
+  assert.ok(!names.some(n => n.includes('-repaired')),
+    'folder keeps its original name');
+  const outAcaml = names.find(n => /\.acaml$/i.test(n));
+  const txt = new TextDecoder().decode(await app.readZipFile(z, outAcaml));
+  const inAcaml = [...zin.files.keys()].find(n => /\.acaml$/i.test(n));
+  const before = ((new TextDecoder().decode(await app.readZipFile(zin, inAcaml)))
+    .match(/<MeasData /g) || []).length;
+  assert.equal((txt.match(/<MeasData /g) || []).length, before + 2,
+    'the two uncommitted runs gain manifest rows');
+  const outMfx = names.find(n => /\.mfx$/i.test(n));
+  const mfxTxt = new TextDecoder().decode(await app.readZipFile(z, outMfx));
+  const expectMfx = new TextDecoder().decode(inMfxBytes).replace(
+    /(<File Path="Run.acaml"[^>]*Identifier=")[0-9a-f]{32}(")/,
+    `$1${app.md5Hex(await app.readZipFile(z, outAcaml))}$2`);
+  assert.equal(mfxTxt, expectMfx,
+    'mfx verbatim except the identifier tracking the repaired manifest');
+
+  // Snapshot files must survive under their own names (nothing dropped).
+  reset();
+  await app.parseOlax(fxDup.buffer, 'dup.olax');
+  const outs2 = await app.buildRepairedOlax(fxDup.buffer, 'dup.olax', 'keepall');
+  const z2 = app.parseZip(await blobToU8(outs2[0].blob));
+  const names2 = [...z2.files.keys()].map(n => decodeURIComponent(
+    n.replace(/\+/g, ' ').replace(/%5c/g, '/')));
+  assert.ok(names2.some(n => /snapshot-.*Run_Test\.dx$/.test(n.split('/').pop())),
+    'snapshot dx kept under its snapshot name');
+  assert.ok(names2.some(n => n.split('/').pop() === 'Run_Test.dx'),
+    'regular dx kept');
+});
+
 test('variant freshid: new DocID under a valid checksum', async () => {
   // The <DocID> is the document identity a document backend keys on.
   // freshid must swap it BEFORE the checksum is recomputed, so the

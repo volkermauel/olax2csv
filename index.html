@@ -1814,9 +1814,14 @@ async function buildRepairedOlax(arrayBuffer, containerName, variant = "") {
   //   nocommit  – repairs files/checksums but adds no manifest rows
   //   origacaml – ships the manifest byte-identically, everything else on
   //   freshid   – full repair, plus a newly minted identity (<DocID>)
+  //   keepall   – single-variable probe against a native export: every part
+  //               ships byte-identically under its original name (snapshot
+  //               files kept, folder not renamed, .mfx untouched); the
+  //               manifest gains only the missing injection rows
   // The default is the production behavior.
   const outer = parseZip(new Uint8Array(arrayBuffer));
   const plan = computeContainerRepairPlan(outer);
+  const keepAll = variant === "keepall";
   const dropSet = new Set(plan.drop);
   const promoteMap = new Map(plan.promote.map(p => [p.from, p.to]));
   const hasWrapper = outer.files.has("[Content_Types].xml");
@@ -1849,8 +1854,9 @@ async function buildRepairedOlax(arrayBuffer, containerName, variant = "") {
         .map(([f, t]) => [withinOf(f), withinOf(t)]),
     ];
     const entries = g.entries
-      .filter(e => !dropSet.has(e.name))
-      .map(e => ({ name: e.name, finalName: promoteMap.get(e.name) || e.name }))
+      .filter(e => keepAll || !dropSet.has(e.name))
+      .map(e => ({ name: e.name,
+        finalName: keepAll ? e.name : (promoteMap.get(e.name) || e.name) }))
       .map(e => ({ ...e, within: withinOf(e.finalName) }));
 
     // Give the repaired result set its own name so importing never
@@ -1862,8 +1868,8 @@ async function buildRepairedOlax(arrayBuffer, containerName, variant = "") {
       t.replace(/\+/g, "%2b").replace(/ /g, "+");
     const encodePartName = t =>
       t.split("/").map(encodePartSeg).join("%5c");
-    const renameFolder = f =>
-      /\.rslt$/i.test(f) ? f.replace(/\.rslt$/i, "") + "-repaired.rslt" : f;
+    const renameFolder = keepAll ? (f => f) : (f =>
+      /\.rslt$/i.test(f) ? f.replace(/\.rslt$/i, "") + "-repaired.rslt" : f);
     const folderPrefixOf = n => {
       const i = n.indexOf("%5c");
       return i < 0 ? null : n.slice(0, i);
@@ -1887,14 +1893,18 @@ async function buildRepairedOlax(arrayBuffer, containerName, variant = "") {
     // 'nocommit' isolates the commit feature; 'origacaml' ships the manifest
     // byte-identically; 'freshid' mints a new identity under the same rules.
     const recs = variant === "nocommit"
-      ? [] : await computeCommitRecords(outer, entries, withinMap);
+      ? [] : await computeCommitRecords(outer,
+          keepAll ? entries.filter(e => !SNAPSHOT_SEG.test(e.within)) : entries,
+          withinMap);
     const acamlE = entries.find(e => /\.acaml$/i.test(e.finalName));
     let acamlBytes = variant !== "origacaml" && acamlE &&
       (withinMap.length || recs.length || variant === "freshid" ||
         newStem != null)
       ? repairAcamlManifest(
-          await readZipFile(outer, acamlE.name), withinMap, recs,
-          { freshDocId: variant === "freshid", description: newStem })
+          await readZipFile(outer, acamlE.name),
+          keepAll ? [] : withinMap, recs,
+          { freshDocId: variant === "freshid",
+            description: keepAll ? null : newStem })
       : null;
     if (acamlBytes && variant === "agifile")
       acamlBytes = agilentWriterForm(acamlBytes);
@@ -1920,7 +1930,18 @@ async function buildRepairedOlax(arrayBuffer, containerName, variant = "") {
     }
     if (!files.length) continue;
 
-    if (mfxIdx >= 0) {
+    if (keepAll && mfxIdx >= 0 && acamlFinal && mfxData) {
+      // The untouched mfx still names the ORIGINAL manifest bytes; keep it
+      // verbatim except the one identifier that must track the manifest we
+      // actually ship (the only inconsistency a native export never has).
+      const acamlMd5 = md5Hex(acamlFinal.data);
+      const patched = new TextDecoder().decode(mfxData).replace(
+        new RegExp('(<File Path="' + escapeRe(xmlEscVal(acamlFinal.name)) +
+          '"[^>]*Identifier=")[0-9a-f]{32}(")'),
+        "$1" + acamlMd5 + "$2");
+      files[mfxIdx] = { ...files[mfxIdx], data: encodeUTF8(patched) };
+    }
+    if (mfxIdx >= 0 && !keepAll) {
       // One entry per shipped data file, identifier = MD5 of the bytes we
       // actually write (covers renamed/promoted files and the repaired
       // .acaml alike). The mfx itself is not self-listed.
