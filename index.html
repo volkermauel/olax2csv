@@ -49,7 +49,7 @@
       <button id="zipBtn" class="primary" disabled>Download traces as ZIP (CSV)</button>
       <button id="zipAllBtn" disabled>Download ALL traces as ZIP</button>
       <button id="xlsxBtn" class="primary" disabled>Download results as Excel (.xlsx)</button>
-      <button id="repairedBtn" disabled title="Download repaired .olax archive(s): measurements acquired under an unclosed snapshot session are renamed to their regular file names, partial snapshot duplicates of completed runs are removed, and the OPC package parts (_rels/.rels, [Content_Types].xml) are kept consistent. One .olax per result set — also for .zip inputs.">Download repaired .olax</button>
+      <button id="repairedBtn" disabled title="Download repaired .olax archive(s): measurements acquired under an unclosed snapshot session are renamed to their regular file names, partial snapshot duplicates of completed runs are removed, and the OPC package parts (_rels/.rels, [Content_Types].xml) are kept consistent. One .olax per result set — also for .zip inputs. Note: CMC servers validate the manifest against the original result set at load time and reject any manifest edit (&quot;invalid or missing checksum&quot;), so on CMC the recovered injections are delivered by the CSV/XLSX exports; the repaired .olax serves non-CMC OpenLab clients.">Download repaired .olax</button>
     </div>
     <div style="margin-top:10px" class="mono">
       <b>Raw traces → CSV</b>: columns <b>time_ms, time_s, time_min, value</b>, one <b>.dx</b> per measurement.<br/>

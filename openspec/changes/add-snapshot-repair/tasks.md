@@ -152,3 +152,17 @@
        (build-time, local offset), version, dc:title in native order with
        the UTF-8 BOM. Confirmed structurally against the native export;
        71/71 green; plain variant passes VerifyStream and Package.Open.
+- [x] 33. Import-bisection against the live CMC server (decisive matrix):
+       plain / nocommit / agifile / keepall / freshid / freshname all fail
+       injection load with "invalid or missing checksum" although every
+       checksum passes Agilent's own AcamlChecksum.VerifyStream; the
+       byte-identical manifest (origacaml) passes the checksum gate and
+       fails only on the dropped snapshot .rx; the native CMC export
+       (original bytes + complete fileset) loads. Conclusion: the CMC
+       server validates the manifest against the original result set's
+       stored state regardless of DocID, IdentParam sequence names,
+       Description, or folder — no authorable manifest edit passes the
+       load gate. The repair deliverable is therefore the CSV export
+       (all 22 injections) plus the repaired archive as a best-effort
+       import; the diagnostic variants stay available for documentation.
+       73/73 green.

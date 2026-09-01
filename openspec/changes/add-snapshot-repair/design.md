@@ -84,3 +84,37 @@ original encoded part names verbatim.
   `.mfx` carries no checksum and is rewritten freely. Application-build
   metadata like `appVersion="SNAPSHOT-2026-…"` is version metadata, not a
   file reference, and is never touched.
+
+## CMC load gate — empirical outcome
+
+A second round of bisection ran the repaired archives against the live CMC
+server (the only place the load-time validator exists; it is absent from the
+398 client-side DLLs). Eight imports form a closed matrix:
+
+| manifest bytes | identity | fileset | injection load |
+| --- | --- | --- | --- |
+| edited (plain, nocommit, agifile, keepall) | original | repaired | checksum error |
+| edited (freshid) | new DocID | repaired | checksum error |
+| edited (freshname) | fresh DocID + IdentParam names + Description + folder | repaired | checksum error |
+| byte-identical (origacaml) | original | snapshots dropped | passes checksum, fails missing `.rx` |
+| byte-identical (native CMC export) | original | complete | loads |
+
+Every edited manifest carries a checksum that passes Agilent's own
+`AcamlChecksum.VerifyStream`, and the byte-identical manifest passes the
+gate, so the server is not merely recomputing: it compares the manifest
+against the original result set's stored state and matches it by content no
+renameable identity (DocID, sequence `<IdentParam>` names, Description,
+folder) can escape. The load path also requires every manifest-referenced
+file on disk (origacaml's missing snapshot `.rx`).
+
+Consequences:
+
+- No authorable manifest edit can make CMC list and load the uncommitted
+  injections. The visible-repair goal inside CMC is unreachable from an
+  `.olax`; only CMC's own export of the original bytes loads.
+- The repair deliverable is the **CSV export** (all acquired injections,
+  including the snapshot-recovered ones) plus the repaired archive as a
+  best-effort import for non-CMC OpenLab clients.
+- The `keepall`/`origacaml`/`freshid`/`freshname`/`agifile`/`nocommit`
+  variants remain available (`?variant=…`) as documented diagnostics of
+  this investigation.
