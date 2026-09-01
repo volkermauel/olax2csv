@@ -250,38 +250,57 @@ function crc32(u8) {
 function le16(n) { return [n & 255, (n >>> 8) & 255]; }
 function le32(n) { return [n & 255, (n >>> 8) & 255, (n >>> 16) & 255, (n >>> 24) & 255]; }
 
-function zipStore(files) {
-  // files: [{name, dataUint8}]
+async function zipStore(files) {
+  // files: [{name, data, store?}] — parts flagged `store` are written
+  // uncompressed (native archives keep the wrapper parts stored and deflate
+  // every data part); anything else is deflated when the runtime can.
+  const prepared = [];
+  for (const f of files) {
+    const crc = crc32(f.data);
+    let data = f.data, method = 0;
+    if (!f.store && typeof CompressionStream !== "undefined" &&
+        typeof Response !== "undefined" && f.data.length > 0) {
+      try {
+        const cs = new CompressionStream("deflate-raw");
+        const deflated = new Uint8Array(await new Response(
+          new Blob([f.data]).stream().pipeThrough(cs)).arrayBuffer());
+        if (deflated.length < f.data.length) { data = deflated; method = 8; }
+      } catch (e) { /* fall back to stored */ }
+    }
+    prepared.push({ name: f.name, data, crc, method, uSize: f.data ? f.data.length : 0, orig: f.data });
+  }
+  return zipEntries(prepared);
+}
+
+function zipEntries(files) {
   const parts = [];
   const central = [];
   let offset = 0;
 
   for (const f of files) {
     const nameBytes = encodeUTF8(f.name);
-    const data = f.data;
-    const c = crc32(data);
 
     // Local file header
     const lfh = [
-      ...le32(0x04034b50), ...le16(20), ...le16(0), ...le16(0),
+      ...le32(0x04034b50), ...le16(20), ...le16(0), ...le16(f.method),
       ...le16(0), ...le16(0),
-      ...le32(c), ...le32(data.length), ...le32(data.length),
+      ...le32(f.crc), ...le32(f.data.length), ...le32(f.uSize),
       ...le16(nameBytes.length), ...le16(0)
     ];
-    parts.push(new Uint8Array(lfh), nameBytes, data);
+    parts.push(new Uint8Array(lfh), nameBytes, f.data);
 
     // Central directory header
     const cdh = [
-      ...le32(0x02014b50), ...le16(20), ...le16(20), ...le16(0), ...le16(0),
+      ...le32(0x02014b50), ...le16(20), ...le16(20), ...le16(0), ...le16(f.method),
       ...le16(0), ...le16(0),
-      ...le32(c), ...le32(data.length), ...le32(data.length),
+      ...le32(f.crc), ...le32(f.data.length), ...le32(f.uSize),
       ...le16(nameBytes.length), ...le16(0), ...le16(0),
       ...le16(0), ...le16(0),
       ...le32(0), ...le32(offset)
     ];
     central.push(new Uint8Array(cdh), nameBytes);
 
-    offset += lfh.length + nameBytes.length + data.length;
+    offset += lfh.length + nameBytes.length + f.data.length;
   }
 
   const cdStart = offset;
@@ -940,6 +959,10 @@ async function parseMeasurementResults(zipView, dxName, measIndex, meta, signalM
    and process each ".rslt" folder as one result set. */
 
 function normZipPath(name) {
+  // Native OPC part names percent-encode a literal "+" as "%2b" and use a
+  // raw "+" for a space (Content-Manager zips keep raw names instead).
+  if (/%5c/i.test(name))
+    name = name.replace(/\+/g, " ").replace(/%2b/gi, "+");
   return name.replace(/%5c/gi, "/").replace(/\\/g, "/").split("/");
 }
 
@@ -1833,6 +1856,12 @@ async function buildRepairedOlax(arrayBuffer, containerName, variant = "") {
     // Give the repaired result set its own name so importing never
     // collides with an existing copy (OpenLab would otherwise offer a
     // rename/skip dialog). Folder-less OPC inputs keep their names.
+    // Native OPC part-name encoding: a literal "+" is percent-encoded
+    // ("%2b"), a space becomes "+", and the in-package separator is "%5c".
+    const encodePartSeg = t =>
+      t.replace(/\+/g, "%2b").replace(/ /g, "+");
+    const encodePartName = t =>
+      t.split("/").map(encodePartSeg).join("%5c");
     const renameFolder = f =>
       /\.rslt$/i.test(f) ? f.replace(/\.rslt$/i, "") + "-repaired.rslt" : f;
     const folderPrefixOf = n => {
@@ -1877,14 +1906,13 @@ async function buildRepairedOlax(arrayBuffer, containerName, variant = "") {
     let mfxIdx = -1, mfxData = null;
     for (let i = 0; i < entries.length; i++) {
       const e = entries[i];
-      const prefix = hasWrapper
+      const opc = hasWrapper
         ? folderPrefixOf(e.finalName) != null
           ? renameFolder(folderPrefixOf(e.finalName)) + "%5c" + e.finalName.slice(folderPrefixOf(e.finalName).length + 3)
           : e.finalName
         : g.folderName
-          ? newKey + "%5c" + e.finalName.slice(g.key.length + 1).replace(/\//g, "%5c")
-          : (newFolder || stem + ".rslt") + "%5c" + e.finalName.replace(/\//g, "%5c");
-      const opc = prefix;
+          ? encodePartSeg(newKey) + "%5c" + encodePartName(e.finalName.slice(g.key.length + 1))
+          : encodePartSeg(newFolder || stem + ".rslt") + "%5c" + encodePartName(e.finalName);
       let data = await readZipFile(outer, e.name);
       if (/\.acaml$/i.test(e.finalName) && acamlFinal) data = acamlFinal.data;
       if (/\.mfx$/i.test(e.finalName)) { mfxIdx = files.length; mfxData = data; }
@@ -1922,7 +1950,7 @@ async function buildRepairedOlax(arrayBuffer, containerName, variant = "") {
         if (!keep.has(finalTarget)) return "";
         return tag.replace('Target="' + m[1] + '"', 'Target="/' + finalTarget + '"');
       });
-      files.push({ name: "_rels/.rels", data: encodeUTF8(rels) });
+      files.push({ name: "_rels/.rels", data: encodeUTF8(rels), store: true });
     } else {
       // Synthesized wrapper: mirror native archives, which carry a package
       // core-properties (psmdcp) part — category "Agilent OpenLab Archive
@@ -1950,31 +1978,38 @@ async function buildRepairedOlax(arrayBuffer, containerName, variant = "") {
         `<dc:title>${xmlEscVal(title)}</dc:title>` +
         "<version>1.1</version></coreProperties>";
       // Data-part relationships first, core-properties last (native order).
+      const relId = () => {
+        const b = new Uint8Array(8);
+        (typeof crypto !== "undefined" && crypto.getRandomValues
+          ? crypto : { getRandomValues: a => { for (let i = 0; i < a.length; i++) a[i] = Math.floor(Math.random() * 256); } })
+          .getRandomValues(b);
+        return "R" + [...b].map(x => x.toString(16).padStart(2, "0")).join("");
+      };
       rels = "\ufeff<?xml version=\"1.0\" encoding=\"utf-8\"?>" +
         "<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">" +
-        files.map((f, i) => `<Relationship Type=\"${REL_TYPE}\" Target=\"/${f.name}\" Id=\"R${(i + 1).toString(16).padStart(16, "0")}\"/>`).join("") +
-        `<Relationship Type=\"http://schemas.openxmlformats.org/package/2006/relationships/metadata/core-properties\" Target=\"/${coreName}\" Id=\"R${(files.length + 1).toString(16).padStart(16, "0")}\"/>` +
+        files.map(f => `<Relationship Type=\"${REL_TYPE}\" Target=\"/${f.name}\" Id=\"${relId()}\"/>`).join("") +
+        `<Relationship Type=\"http://schemas.openxmlformats.org/package/2006/relationships/metadata/core-properties\" Target=\"/${coreName}\" Id=\"${relId()}\"/>` +
         "</Relationships>";
-      files.push({ name: coreName, data: encodeUTF8(coreProps) });
-      files.push({ name: "_rels/.rels", data: encodeUTF8(rels) });
+      files.push({ name: "_rels/.rels", data: encodeUTF8(rels), store: true });
+      files.push({ name: coreName, data: encodeUTF8(coreProps), store: true });
       const exts = new Set(files
         .map(f => f.name.split(".").pop().toLowerCase())
-        .filter(ext => ext !== "rels" && ext !== "psmdcp"));
+        .filter(ext => ext !== "rels" && ext !== "psmdcp" && ext !== "xml"));
       let ct = "\ufeff<?xml version=\"1.0\" encoding=\"utf-8\"?>" +
-        "<Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\">" +
-        "<Default Extension=\"rels\" ContentType=\"application/vnd.openxmlformats-package.relationships+xml\"/>" +
-        "<Default Extension=\"psmdcp\" ContentType=\"application/vnd.openxmlformats-package.core-properties+xml\"/>";
+        "<Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\">";
       for (const ext of exts)
         ct += `<Default Extension=\"${ext}\" ContentType=\"Agilent.OpenLab.Archive/ArchiveFile\"/>`;
-      files.push({ name: "[Content_Types].xml", data: encodeUTF8(ct + "</Types>") });
+      ct += "<Default Extension=\"rels\" ContentType=\"application/vnd.openxmlformats-package.relationships+xml\"/>" +
+        "<Default Extension=\"psmdcp\" ContentType=\"application/vnd.openxmlformats-package.core-properties+xml\"/>";
+      files.push({ name: "[Content_Types].xml", data: encodeUTF8(ct + "</Types>"), store: true });
     }
-    if (hasWrapper) for (const w of wrapperFiles) files.push(w);
+    if (hasWrapper) for (const w of wrapperFiles) files.push({ ...w, store: true });
     const tag = variant ? "-" + variant : "";
     outputs.push({
       name: groups.length === 1
         ? stem + ".repaired" + tag + ".olax"
         : sanitizeName(newStem || stem) + tag + ".olax",
-      blob: zipStore(files),
+      blob: await zipStore(files),
     });
   }
   return outputs;
@@ -2002,7 +2037,7 @@ async function downloadRepaired() {
     if (items.length === 1) {
       downloadBlob(items[0].blob, items[0].name);
     } else {
-      const wrap = zipStore(await Promise.all(items.map(async it => ({
+      const wrap = await zipStore(await Promise.all(items.map(async it => ({
         name: it.name,
         data: new Uint8Array(await it.blob.arrayBuffer()),
       }))));
@@ -2383,7 +2418,7 @@ async function buildAndDownloadZip(traces, label) {
       out.push({ name: t.csvName, data: encodeUTF8(t.csvText) });
     }
 
-    const zipBlob = zipStore(out);
+    const zipBlob = await zipStore(out);
     const zipName = (store.files.length === 1
       ? sanitizeName(store.files[0].name.replace(/\.olax$/i,""))
       : "olax_export") + "_traces.zip";

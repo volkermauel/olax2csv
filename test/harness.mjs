@@ -15,6 +15,7 @@ import { createRequire } from 'node:module';
 import { DOMParser as _DP } from '@xmldom/xmldom';
 
 const require = createRequire(import.meta.url);
+const RealBlob = globalThis.Blob; // captured before the VM context shadows it
 export const XLSX = require('xlsx/dist/xlsx.full.min.js');
 
 const html = fs.readFileSync(new URL('../index.html', import.meta.url), 'utf8');
@@ -78,7 +79,26 @@ export function loadApp() {
     Promise, Error, RegExp, Boolean, parseInt, parseFloat, isFinite, isNaN,
     setTimeout, clearTimeout,
   };
-  ctx.Blob = class Blob { constructor(parts, opts) { this.parts = parts; this.type = opts && opts.type; } };
+  ctx.Blob = class Blob {
+    constructor(parts, opts) { this.parts = parts; this.type = opts && opts.type; }
+    stream() {
+      const chunks = this.parts.map(p => p instanceof ArrayBuffer ? new Uint8Array(p)
+        : ArrayBuffer.isView(p) ? new Uint8Array(p.buffer, p.byteOffset, p.byteLength)
+        : Array.isArray(p) ? Uint8Array.from(p) : new TextEncoder().encode(String(p)));
+      return new RealBlob(chunks.map(c => c.slice())).stream();
+    }
+    async arrayBuffer() {
+      const chunks = this.parts.map(p => p instanceof ArrayBuffer ? new Uint8Array(p)
+        : ArrayBuffer.isView(p) ? new Uint8Array(p.buffer, p.byteOffset, p.byteLength)
+        : Array.isArray(p) ? Uint8Array.from(p) : new TextEncoder().encode(String(p)));
+      let len = 0; for (const c of chunks) len += c.length;
+      const out = new Uint8Array(len); let o = 0;
+      for (const c of chunks) { out.set(c, o); o += c.length; }
+      return out.buffer;
+    }
+  };
+  ctx.CompressionStream = globalThis.CompressionStream;
+  ctx.Response = globalThis.Response;
   ctx.URL = { createObjectURL: () => 'blob:x', revokeObjectURL() {} };
   ctx.alert = () => {}; // browser dialog; noop under test
   ctx.globalThis = ctx;

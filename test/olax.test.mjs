@@ -232,7 +232,7 @@ test('csv zip export: store-zip round-trips through parseZip/readZipFile', async
 });
 
 test('raw trace: works when the .dx sits at an unaligned stored offset', async () => {
-  // Repaired archives store every entry uncompressed, so a .dx lands at an
+  // Stored (uncompressed) entries sit at arbitrary byte offsets inside the
   // arbitrary byte offset inside the outer zip and readZipFile returns a
   // zero-copy subarray view. Float64 trace access must survive that —
   // regression for "ZIP export failed: start offset of Float64Array
@@ -241,7 +241,7 @@ test('raw trace: works when the .dx sits at an unaligned stored offset', async (
   const f64 = new Float64Array(n); // all zeros -> findAllZeroSegment path
   // Inner entry name of 7 chars + 3-byte outer shift puts the float block
   // at absolute offset 3 + 30 + 7 = 40 (8-aligned), like real stored data.
-  const dxBytes = blobToU8(app.zipStore([{ name: 'TRAC.CH', data: new Uint8Array(f64.buffer) }]));
+  const dxBytes = blobToU8(await app.zipStore([{ name: 'TRAC.CH', data: new Uint8Array(f64.buffer), store: true }]));
   const padded = new Uint8Array(3 + dxBytes.length);
   padded.set(dxBytes, 3);
   const dxZip = app.parseZip(padded.subarray(3));
@@ -258,7 +258,7 @@ test('raw trace: works when the .dx sits at an unaligned stored offset', async (
   // Also the gaussian path on an unaligned view.
   const g = new Float64Array(n);
   for (let i = 0; i < n; i++) g[i] = Math.sin(i / 3);
-  const dx2 = blobToU8(app.zipStore([{ name: 'GA.CH', data: new Uint8Array(g.buffer) }]));
+  const dx2 = blobToU8(await app.zipStore([{ name: 'GA.CH', data: new Uint8Array(g.buffer), store: true }]));
   const p2 = new Uint8Array(5 + dx2.length); p2.set(dx2, 5);
   const t2 = {
     traceId: 'GA', dxZip: app.parseZip(p2.subarray(5)), n, slope: 2,

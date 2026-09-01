@@ -806,3 +806,65 @@ test('agifile variant: acaml in the native writer byte shape', async () => {
   assert.ok(!/^\t</m.test(text.replace(/\n\t<Checksum Algorithm="MD5">[\s\S]*?\n\t<\/Checksum>/, '')),
     'no other tab-indented elements');
 });
+
+test('repaired wrapper matches native .olax layout', async () => {
+  // Native OPC part names percent-encode a literal "+" as "%2b", use "+"
+  // for a space, and separate folder and file with "%5c" — while manifest
+  // (.acaml) and fileset (.mfx) references keep the raw instrument names.
+  // Wrapper parts (_rels/.rels, psmdcp, [Content_Types].xml) are stored
+  // uncompressed and [Content_Types].xml is the LAST entry; data parts are
+  // deflated when the runtime supports it.
+  const { acmdInjection, enc, makeZip, TRACE1 } = await import('./fixtures/build-olax.mjs');
+  const dxInner = makeZip([
+    { name: 'injection.acmd', data: enc(acmdInjection(10, 0, 1, 6000, 5, 3000, 'Test')) },
+    { name: `${TRACE1}.CH`, data: new Uint8Array(10 * 8) },
+    { name: 'TRACE1.CH', data: new Uint8Array(10 * 8) },
+  ]);
+  const outer = makeZip([
+    { name: 'spacey run.rslt/Run Test+1.acaml', data: enc(
+      `<?xml version="1.0"?>\r\n<ACAML xmlns="urn:schemas-agilent-com:acaml21" schemaversion="2.1.30.999">\r\n  <Checksum Algorithm="MD5">\r\n    <Value>placeholder==</Value>\r\n  </Checksum>\r\n  <Doc><DocID>d</DocID><Description>spacey run</Description><CreatedByUser>u</CreatedByUser><CreationDate>2026-08-28T15:15:00+02:00</CreationDate><Content>\r\n    <MeasData>\r\n      <Injection>1</Injection>\r\n      <Path>Run Test+1.dx</Path>\r\n      <Signals>\r\n        <Signal><Name>TRACE1</Name></Signal>\r\n      </Signals>\r\n    </MeasData>\r\n  </Content></Doc>\r\n</ACAML>\r\n`.replaceAll('\r\n', '\n')) },
+    { name: 'spacey run.rslt/Run Test+1.dx', data: dxInner },
+  ]);
+  reset();
+  await app.parseOlax(outer.buffer, 'spacey.zip');
+  const outs = await app.buildRepairedOlax(outer.buffer, 'spacey.zip');
+  const u8 = blobToU8(outs[0].blob);
+  const z = app.parseZip(u8);
+  const names = [...z.files.keys()];
+
+  // folder rename applies to the decoded folder; part names use native encoding
+  assert.ok(names.includes('spacey+run-repaired.rslt%5cRun+Test%2b1.dx'),
+    'space->"+", plus->"%2b": ' + names.join(' | '));
+  assert.ok(!names.some(n => n.includes(' ')), 'no raw spaces in part names');
+  const rels = new TextDecoder().decode(await app.readZipFile(z, '_rels/.rels'));
+  assert.ok(rels.includes('"/spacey+run-repaired.rslt%5cRun+Test%2b1.dx"'),
+    'rels targets use the native encoding');
+
+  // manifest keeps RAW names
+  const acamlN = names.find(n => /\.acaml$/i.test(n));
+  const acaml = new TextDecoder().decode(await app.readZipFile(z, acamlN));
+  assert.ok(acaml.includes('<Path>Run Test+1.dx</Path>'), 'acaml path stays raw');
+  assert.ok(acaml.includes('<Description>spacey+run-repaired</Description>') ||
+    acaml.includes('<Description>spacey run-repaired</Description>'),
+    'description states the repaired name');
+
+  // reparse round-trips through the decode
+  reset();
+  await app.parseOlax(u8.buffer, 'repaired.olax', { repairSnapshots: false });
+  assert.ok(app.allTraces().length >= 1, 'reparse decodes part names');
+
+  // compression + entry order parity (native layout)
+  if (typeof CompressionStream !== 'undefined' && typeof Response === 'function') {
+    const dxEntry = z.files.get('spacey+run-repaired.rslt%5cRun+Test%2b1.dx');
+    assert.equal(dxEntry.method, 8, 'data parts deflated');
+    for (const w of ['_rels/.rels', '[Content_Types].xml'])
+      assert.equal(z.files.get(w).method, 0, w + ' stored');
+  }
+  const idx = names.indexOf('[Content_Types].xml');
+  assert.equal(idx, names.length - 1, '[Content_Types].xml is the last entry');
+
+  // relationship ids: R + 16 lowercase hex, like native exports
+  const ids = [...rels.matchAll(/Id="(R[0-9a-f]+)"/g)].map(m => m[1]);
+  assert.ok(ids.length >= 2);
+  assert.ok(ids.every(id => /^R[0-9a-f]{16}$/.test(id)), 'native rel id form');
+});

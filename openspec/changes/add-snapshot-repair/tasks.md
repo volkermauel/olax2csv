@@ -134,3 +134,13 @@
        block; content and checksum value untouched — the shape
        `AcamlConvert.WriteToStream` emits). Verified against the Agilent
        assembly on the real RAD archive; 70/70 green.
+- [x] 31. Wrapper parity with real .olax exports (berlin reference):
+       part names percent-encode a literal "+" as "%2b" and a space as "+"
+       (acaml/mfx references keep raw instrument names), data parts are
+       DEFLATED (35 MB -> 8.8 MB for the RAD archive) with only
+       _rels/.rels, psmdcp and [Content_Types].xml stored,
+       [Content_Types].xml is the last entry, and relationship ids use
+       the native "R"+16-hex form. Reparse decodes "+"/"%2b" so repaired
+       archives and native .olax inputs round-trip. 71/71 green; all
+       variants pass Agilent AcamlChecksum.VerifyStream and open under
+       System.IO.Packaging.
