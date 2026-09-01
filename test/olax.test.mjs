@@ -230,3 +230,44 @@ test('csv zip export: store-zip round-trips through parseZip/readZipFile', async
     'value preserved after store-zip round-trip',
   );
 });
+
+test('raw trace: works when the .dx sits at an unaligned stored offset', async () => {
+  // Repaired archives store every entry uncompressed, so a .dx lands at an
+  // arbitrary byte offset inside the outer zip and readZipFile returns a
+  // zero-copy subarray view. Float64 trace access must survive that —
+  // regression for "ZIP export failed: start offset of Float64Array
+  // should be a multiple of 8".
+  const n = 16;
+  const f64 = new Float64Array(n); // all zeros -> findAllZeroSegment path
+  // Inner entry name of 7 chars + 3-byte outer shift puts the float block
+  // at absolute offset 3 + 30 + 7 = 40 (8-aligned), like real stored data.
+  const dxBytes = blobToU8(app.zipStore([{ name: 'TRAC.CH', data: new Uint8Array(f64.buffer) }]));
+  const padded = new Uint8Array(3 + dxBytes.length);
+  padded.set(dxBytes, 3);
+  const dxZip = app.parseZip(padded.subarray(3));
+  const t = {
+    traceId: 'TRAC', dxZip, n, slope: 1, min: 0, max: 0,
+    timeStart: 0, timeEnd: 1600, valueHeader: 'y_mAU',
+  };
+  await app.buildCSVForTrace(t);
+  const lines = t.csvText.trim().split('\n');
+  assert.equal(lines.length - 1, n, 'all points exported');
+  for (let i = 1; i <= n; i++)
+    assert.equal(Number(lines[i].split(',')[3]), 0, `zero @row ${i}`);
+
+  // Also the gaussian path on an unaligned view.
+  const g = new Float64Array(n);
+  for (let i = 0; i < n; i++) g[i] = Math.sin(i / 3);
+  const dx2 = blobToU8(app.zipStore([{ name: 'GA.CH', data: new Uint8Array(g.buffer) }]));
+  const p2 = new Uint8Array(5 + dx2.length); p2.set(dx2, 5);
+  const t2 = {
+    traceId: 'GA', dxZip: app.parseZip(p2.subarray(5)), n, slope: 2,
+    min: Math.min(...g) * 2, max: Math.max(...g) * 2,
+    timeStart: 0, timeEnd: 1600, valueHeader: 'g_mAU',
+  };
+  await app.buildCSVForTrace(t2);
+  const rows2 = t2.csvText.trim().split('\n');
+  assert.equal(rows2.length - 1, n, 'gaussian path: all points exported');
+  const first = Number(rows2[1].split(',')[3]);
+  assert.ok(Math.abs(first - Math.sin(0) * 2) < 1e-12, 'values decoded, not garbage');
+});

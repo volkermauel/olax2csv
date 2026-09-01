@@ -371,12 +371,28 @@ function sampleNameFromDxPath(dxPath) {
    Raw trace extraction (unchanged)
    ============================ */
 
+function align8(u8) {
+  // Zip entries can be zero-copy subarray views at any byte offset; float64
+  // access needs an 8-aligned start. Trim the view (never copy) so the
+  // alignment invariant holds for every caller.
+  const rem = u8.byteOffset % 8;
+  if (rem === 0) return u8;
+  const drop = 8 - rem;
+  return u8.byteLength > drop ? u8.subarray(drop) : new Uint8Array(0);
+}
+
+function f64Of(u8, n) {
+  const a = align8(u8);
+  return new Float64Array(a.buffer, a.byteOffset, n);
+}
+
 function bestFloatSegment(u8, n, slope, expMin, expMax) {
   // Try float64 segments at 8-byte aligned offsets.
   const minTol = Math.max(50, 0.05 * Math.abs(expMin || 0));
   const maxTol = Math.max(10, 0.02 * Math.abs(expMax || 0));
   let best = null;
 
+  u8 = align8(u8);
   const buf = u8.buffer;
   const base = u8.byteOffset;
   const limit = u8.byteLength - n * 8;
@@ -414,6 +430,7 @@ function bestFloatSegment(u8, n, slope, expMin, expMax) {
 }
 
 function findAllZeroSegment(u8, n) {
+  u8 = align8(u8);
   const buf = u8.buffer;
   const base = u8.byteOffset;
   const limit = u8.byteLength - n * 8;
@@ -789,12 +806,12 @@ async function buildCSVForTrace(t) {
   let seg = null;
   if (Math.abs(t.min - t.max) < 1e-12 && Math.abs(t.max) < 1e-12) {
     seg = findAllZeroSegment(chBytes, t.n);
-    if (!seg) seg = { off: 0, arr: new Float64Array(chBytes.buffer, chBytes.byteOffset, t.n) };
+    if (!seg) seg = { off: 0, arr: f64Of(chBytes, t.n) };
   } else {
     seg = bestFloatSegment(chBytes, t.n, t.slope, t.min, t.max);
     if (!seg) {
       // fallback: first float64 block
-      seg = { off: 0, arr: new Float64Array(chBytes.buffer, chBytes.byteOffset, t.n) };
+      seg = { off: 0, arr: f64Of(chBytes, t.n) };
     }
   }
 
@@ -1347,11 +1364,18 @@ function repairAcamlManifest(bytes, withinMap, recs, opts) {
   // document backend keys on. Swapping it must happen before the checksum
   // is recomputed, so the checksum covers the new identity.
   const freshId = opts && opts.freshDocId && /<DocID>/.test(text);
-  if (!changed && !commit && !freshId) return bytes;
+  // Result-set rename: <Description> carries the result set name OpenLab
+  // displays; the repaired archive states its own (…-repaired) name.
+  const renamed = opts && opts.description &&
+    /<Description>[^<]*<\/Description>/.test(text);
+  if (!changed && !commit && !freshId && !renamed) return bytes;
   if (/<Checksum Algorithm="(?!MD5)/.test(text)) return bytes; // e.g. SHA1: cannot re-derive
   if (commit) text = commitInjectionRecords(text, recs);
   if (freshId)
     text = text.replace(/(<DocID>)[^<]*(<\/DocID>)/, "$1" + newGuid() + "$2");
+  if (renamed)
+    text = text.replace(/(<Description>)[^<]*(<\/Description>)/,
+      "$1" + opts.description + "$2");
   const canonical = acamlCanonicalDoc(text);
   if (canonical != null) {
     text = text.replace(/(<Checksum Algorithm="MD5">\s*<Value>)[^<]*(<\/Value>)/,
@@ -1789,6 +1813,30 @@ async function buildRepairedOlax(arrayBuffer, containerName, variant = "") {
       .map(e => ({ name: e.name, finalName: promoteMap.get(e.name) || e.name }))
       .map(e => ({ ...e, within: withinOf(e.finalName) }));
 
+    // Give the repaired result set its own name so importing never
+    // collides with an existing copy (OpenLab would otherwise offer a
+    // rename/skip dialog). Folder-less OPC inputs keep their names.
+    const renameFolder = f =>
+      /\.rslt$/i.test(f) ? f.replace(/\.rslt$/i, "") + "-repaired.rslt" : f;
+    const folderPrefixOf = n => {
+      const i = n.indexOf("%5c");
+      return i < 0 ? null : n.slice(0, i);
+    };
+    let oldFolder = null;
+    if (hasWrapper) {
+      const p = entries.length ? folderPrefixOf(entries[0].finalName) : null;
+      if (p != null && /\.rslt$/i.test(p)) oldFolder = p;
+    } else if (g.folderName) {
+      oldFolder = g.folderName.split("/").pop();
+    } else {
+      oldFolder = stem + ".rslt";
+    }
+    const newFolder = oldFolder != null ? renameFolder(oldFolder) : null;
+    const newStem = newFolder != null ? newFolder.replace(/\.rslt$/i, "") : null;
+    const newKey = g.key && oldFolder && newFolder && g.key.endsWith(oldFolder)
+      ? g.key.slice(0, g.key.length - oldFolder.length) + newFolder
+      : g.key;
+
     // Commit records for .dx files the .acaml never committed.
     // 'nocommit' isolates the commit feature; 'origacaml' ships the manifest
     // byte-identically; 'freshid' mints a new identity under the same rules.
@@ -1796,11 +1844,12 @@ async function buildRepairedOlax(arrayBuffer, containerName, variant = "") {
       ? [] : await computeCommitRecords(outer, entries, withinMap);
     const acamlE = entries.find(e => /\.acaml$/i.test(e.finalName));
     const acamlFinal = variant !== "origacaml" && acamlE &&
-      (withinMap.length || recs.length || variant === "freshid") ? {
+      (withinMap.length || recs.length || variant === "freshid" ||
+        newStem != null) ? {
       name: acamlE.within,
       data: repairAcamlManifest(
         await readZipFile(outer, acamlE.name), withinMap, recs,
-        { freshDocId: variant === "freshid" })
+        { freshDocId: variant === "freshid", description: newStem })
     } : null;
     if (recs.length)
       logln(`  ${g.folderName || stem}: committing ${recs.length} acquired-but-` +
@@ -1809,10 +1858,14 @@ async function buildRepairedOlax(arrayBuffer, containerName, variant = "") {
     let mfxIdx = -1, mfxData = null;
     for (let i = 0; i < entries.length; i++) {
       const e = entries[i];
-      const opc = hasWrapper ? e.finalName
+      const prefix = hasWrapper
+        ? folderPrefixOf(e.finalName) != null
+          ? renameFolder(folderPrefixOf(e.finalName)) + "%5c" + e.finalName.slice(folderPrefixOf(e.finalName).length + 3)
+          : e.finalName
         : g.folderName
-          ? g.key + "%5c" + e.finalName.slice(g.key.length + 1).replace(/\//g, "%5c")
-          : stem + ".rslt%5c" + e.finalName.replace(/\//g, "%5c");
+          ? newKey + "%5c" + e.finalName.slice(g.key.length + 1).replace(/\//g, "%5c")
+          : (newFolder || stem + ".rslt") + "%5c" + e.finalName.replace(/\//g, "%5c");
+      const opc = prefix;
       let data = await readZipFile(outer, e.name);
       if (/\.acaml$/i.test(e.finalName) && acamlFinal) data = acamlFinal.data;
       if (/\.mfx$/i.test(e.finalName)) { mfxIdx = files.length; mfxData = data; }
@@ -1842,7 +1895,11 @@ async function buildRepairedOlax(arrayBuffer, containerName, variant = "") {
         const m = tag.match(/Target="([^"]*)"/);
         if (!m) return tag;
         const target = m[1].replace(/^\//, "");
-        const finalTarget = promoteMap.get(target) || target;
+        const pre = folderPrefixOf(target);
+        const finalTarget = promoteMap.get(target) ||
+          (pre != null && pre !== newFolder
+            ? renameFolder(pre) + "%5c" + target.slice(pre.length + 3)
+            : target);
         if (!keep.has(finalTarget)) return "";
         return tag.replace('Target="' + m[1] + '"', 'Target="/' + finalTarget + '"');
       });
@@ -1859,7 +1916,7 @@ async function buildRepairedOlax(arrayBuffer, containerName, variant = "") {
       })();
       const creator = /<CreatedByUser>([^<]*)<\/CreatedByUser>/.exec(acamlText);
       const created = /<CreationDate>([^<]*)<\/CreationDate>/.exec(acamlText);
-      const title = g.folderName || stem + ".rslt";
+      const title = newFolder || g.folderName || stem + ".rslt";
       const coreName = "package/services/metadata/core-properties/" +
         md5Hex(encodeUTF8(title)) + ".psmdcp";
       const coreProps =
@@ -1897,7 +1954,7 @@ async function buildRepairedOlax(arrayBuffer, containerName, variant = "") {
     outputs.push({
       name: groups.length === 1
         ? stem + ".repaired" + tag + ".olax"
-        : sanitizeName((g.folderName || stem).replace(/\.rslt$/i, "")) + tag + ".olax",
+        : sanitizeName(newStem || stem) + tag + ".olax",
       blob: zipStore(files),
     });
   }

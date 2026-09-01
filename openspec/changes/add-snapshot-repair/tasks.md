@@ -114,3 +114,18 @@
        artifacts built from the real RAD input; `System.IO.Packaging`
        opens all four; fileset identifiers track the shipped bytes in
        every variant. 67/67 green.
+- [x] 28. Repaired result sets carry their own name (import never
+       collides with the original): `.rslt` folder gets a `-repaired`
+       suffix in every part name and relationship target, the manifest's
+       `<Description>` and the psmdcp `dc:title` state the repaired name
+       (checksum/fileset identifiers track it), and folder-less OPC inputs
+       keep their names verbatim. Verified with Agilent
+       `AcamlChecksum.VerifyString` + `System.IO.Packaging` on all four
+       RAD artifacts; 69/69 green.
+- [x] 29. Fixed the CSV-zip export crash on repaired archives
+       ("start offset of Float64Array should be a multiple of 8"):
+       stored (uncompressed) entries are zero-copy subarray views at
+       arbitrary offsets, so the float64 trace access now aligns the view
+       once (`align8`/`f64Of`) instead of crashing; regression test drives
+       both the all-zero and gaussian paths through deliberately unaligned
+       views.

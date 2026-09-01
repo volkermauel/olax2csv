@@ -179,15 +179,15 @@ test('repaired olax: snapshot-only run becomes a native regular run', async () =
   await app.parseOlax(fxOnly.buffer, 'snap-only.olax');
   const u8 = await repairedU8(fxOnly, 'snap-only.olax');
   const names = [...app.parseZip(u8).files.keys()].sort();
-  assert.ok(names.includes('snap-only.rslt%5cRun_Test.dx'), 'promoted dx: ' + names.join(' | '));
-  assert.ok(names.includes('snap-only.rslt%5cRun_Test.rx'), 'promoted rx');
+  assert.ok(names.includes('snap-only-repaired.rslt%5cRun_Test.dx'), 'promoted dx: ' + names.join(' | '));
+  assert.ok(names.includes('snap-only-repaired.rslt%5cRun_Test.rx'), 'promoted rx');
   assert.ok(!names.some((n) => n.toLowerCase().includes('snapshot-')), 'no snapshot- names remain');
 
   // OPC wrapper: parts + consistent relationships
   assert.ok(names.includes('[Content_Types].xml') && names.includes('_rels/.rels'), 'OPC wrapper present');
   const targets = await relsTargets(u8);
-  assert.ok(targets.includes('/snap-only.rslt%5cRun_Test.dx'), 'rels references promoted dx');
-  assert.ok(targets.includes('/snap-only.rslt%5cRun_Test.rx'), 'rels references promoted rx');
+  assert.ok(targets.includes('/snap-only-repaired.rslt%5cRun_Test.dx'), 'rels references promoted dx');
+  assert.ok(targets.includes('/snap-only-repaired.rslt%5cRun_Test.rx'), 'rels references promoted rx');
   assert.ok(!targets.some((t) => /snapshot-/i.test(t)), 'no snapshot- rels targets');
   assert.ok(/Extension="acaml"/.test(await contentTypes(u8)), 'content types cover acaml');
 
@@ -202,7 +202,7 @@ test('repaired olax: partial snapshot duplicates are removed', async () => {
   await app.parseOlax(fxDup.buffer, 'snap-dup.olax');
   const u8 = await repairedU8(fxDup, 'snap-dup.olax');
   const names = [...app.parseZip(u8).files.keys()];
-  assert.ok(names.includes('snap-dup.rslt%5cRun_Test.dx'));
+  assert.ok(names.includes('snap-dup-repaired.rslt%5cRun_Test.dx'));
   assert.ok(!names.some((n) => n.toLowerCase().includes('snapshot-')));
   const targets = await relsTargets(u8);
   assert.ok(!targets.some((t) => /snapshot-/i.test(t)), 'dropped parts leave no rels target');
@@ -219,9 +219,9 @@ test('repaired olax: snapshot .rx is promoted next to the regular .dx', async ()
   const u8 = await repairedU8(fxRxOnly, 'snap-rx.olax');
   const names = [...app.parseZip(u8).files.keys()].sort();
   assert.deepEqual(names.filter((n) => /run_test\.(dx|rx)$/i.test(n)),
-    ['snap-rx.rslt%5cRun_Test.dx', 'snap-rx.rslt%5cRun_Test.rx']);
+    ['snap-rx-repaired.rslt%5cRun_Test.dx', 'snap-rx-repaired.rslt%5cRun_Test.rx']);
   const targets = await relsTargets(u8);
-  assert.ok(targets.includes('/snap-rx.rslt%5cRun_Test.rx'), 'rels references promoted rx');
+  assert.ok(targets.includes('/snap-rx-repaired.rslt%5cRun_Test.rx'), 'rels references promoted rx');
 
   reset();
   await app.parseOlax(u8.buffer, 'repaired.olax', { repairSnapshots: false });
@@ -261,7 +261,7 @@ test('CM zip: grouped .rslt with a snapshot-only result set round-trips', async 
 
   // CM zip -> TWO .olax archives (one per result set), both named after their folder
   const outs = await app.buildRepairedOlax(buf.buffer, 'cm.zip');
-  assert.equal(outs.map(o => o.name).sort().join('|'), 'BROKEN.olax|OK.olax');
+  assert.equal(outs.map(o => o.name).sort().join('|'), 'BROKEN-repaired.olax|OK-repaired.olax');
   assert.ok(outs.every(o => /\.olax$/i.test(o.name)), 'always .olax, even for .zip input');
 
   let traces = 0, peaks = 0, files = 0;
@@ -564,9 +564,16 @@ test('repaired olax: mfx with correct identifiers stays byte-identical', async (
   const u8 = await repairedU8(fx, 'healthy-mfx.olax');
   const z = app.parseZip(u8);
   const mfxName = [...z.files.keys()].find(n => /\.mfx$/i.test(n));
-  const out = await app.readZipFile(z, mfxName);
-  assert.equal(Buffer.compare(Buffer.from(out), Buffer.from(mfxBytes)), 0,
-    'mfx byte-identical when already consistent');
+  const out = new TextDecoder().decode(await app.readZipFile(z, mfxName));
+  // The result-set rename swaps <Description> in the .acaml (its checksum
+  // covers the new name), so the fileset's .acaml identifier legitimately
+  // tracks the new bytes — everything else must stay untouched.
+  const acamlName = [...z.files.keys()].find(n => /\.acaml$/i.test(n));
+  const expect = new TextDecoder().decode(mfxBytes).replace(
+    /(<File Path="Run.acaml"[^>]*Identifier=")[0-9a-f]{32}(")/,
+    `$1${app.md5Hex(await app.readZipFile(z, acamlName))}$2`);
+  assert.equal(out, expect,
+    'mfx unchanged except the .acaml identifier that tracks the renamed manifest');
 });
 
 test('repaired olax (commit repair): fileset mirrors the shipped parts',
@@ -748,4 +755,29 @@ test('variant freshid: new DocID under a valid checksum', async () => {
   assert.ok(mfx.includes('Identifier="' +
     app.md5Hex(await app.readZipFile(z, outAcaml)) + '"'),
     'fileset acaml identifier = MD5 of the shipped bytes');
+});
+
+test('repaired result set carries its own name (no import collisions)', async () => {
+  // Importing a repaired archive must never offer a rename/skip dialog
+  // against the original result set: the .rslt folder, the manifest's
+  // <Description> (the displayed name) and the core-properties title all
+  // state the …-repaired name, and no part keeps the old folder prefix.
+  const fx = buildCommitOlax();
+  reset();
+  await app.parseOlax(fx.buffer, 'commit.olax');
+  const u8 = await repairedU8(fx, 'commit.olax');
+  const z = app.parseZip(u8);
+  const names = [...z.files.keys()];
+  const folder = names.map(n => n.split('%5c')[0]).find(f => /\.rslt$/i.test(f));
+  assert.equal(folder, 'commit-repaired.rslt', 'folder renamed');
+  assert.ok(!names.some(n => n.startsWith('commit.rslt%5c')),
+    'no part keeps the original folder prefix');
+  const acamlN = names.find(n => /\.acaml$/i.test(n));
+  const text = new TextDecoder().decode(await app.readZipFile(z, acamlN));
+  assert.ok(text.includes('<Description>commit-repaired</Description>'),
+    'manifest description states the repaired name');
+  const core = names.find(n => n.endsWith('.psmdcp'));
+  const coreXml = new TextDecoder().decode(await app.readZipFile(z, core));
+  assert.match(coreXml, /<dc:title>commit-repaired\.rslt<\/dc:title>/,
+    'core-properties title follows the folder');
 });
