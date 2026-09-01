@@ -458,6 +458,7 @@ ${imd}
    </CustomField>
   </DocInfo>
   <Content>
+   <IdentParam><Name>Run</Name><Description /><ProjectID>CMC</ProjectID></IdentParam>
    <Method id="${METHOD1}" ver="0"><Info /><Name>FixtureMethod</Name></Method>
    <Samples>
     <Setup id="${SETUP1}" ver="0">

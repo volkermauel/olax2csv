@@ -1391,7 +1391,14 @@ function repairAcamlManifest(bytes, withinMap, recs, opts) {
   // displays; the repaired archive states its own (…-repaired) name.
   const renamed = opts && opts.description &&
     /<Description>[^<]*<\/Description>/.test(text);
-  if (!changed && !commit && !freshId && !renamed) return bytes;
+  // Fresh sequence identity (diagnostic variant): <IdentParam><Name> names
+  // the sequence / sample-setup context a result set belongs to. Renaming
+  // it gives the repaired archive an identity no existing record shadows.
+  const identRenamed = opts && opts.identFrom && opts.identTo &&
+    opts.identFrom !== opts.identTo &&
+    new RegExp("(<IdentParam>\\s*<Name>)" + escapeRe(opts.identFrom) +
+      "(</Name>)").test(text);
+  if (!changed && !commit && !freshId && !renamed && !identRenamed) return bytes;
   if (/<Checksum Algorithm="(?!MD5)/.test(text)) return bytes; // e.g. SHA1: cannot re-derive
   if (commit) text = commitInjectionRecords(text, recs);
   if (freshId)
@@ -1399,6 +1406,11 @@ function repairAcamlManifest(bytes, withinMap, recs, opts) {
   if (renamed)
     text = text.replace(/(<Description>)[^<]*(<\/Description>)/,
       "$1" + opts.description + "$2");
+  if (identRenamed)
+    text = text.replace(
+      new RegExp("(<IdentParam>\\s*<Name>)" + escapeRe(opts.identFrom) +
+        "(</Name>)", "g"),
+      "$1" + opts.identTo + "$2");
   const canonical = acamlCanonicalDoc(text);
   if (canonical != null) {
     text = text.replace(/(<Checksum Algorithm="MD5">\s*<Value>)[^<]*(<\/Value>)/,
@@ -1818,6 +1830,9 @@ async function buildRepairedOlax(arrayBuffer, containerName, variant = "") {
   //               ships byte-identically under its original name (snapshot
   //               files kept, folder not renamed, .mfx untouched); the
   //               manifest gains only the missing injection rows
+  //   freshname – full repair plus a wholly fresh identity: new <DocID> and
+  //               renamed sequence <IdentParam> names, so the import cannot
+  //               resolve to the original set's server record
   // The default is the production behavior.
   const outer = parseZip(new Uint8Array(arrayBuffer));
   const plan = computeContainerRepairPlan(outer);
@@ -1885,6 +1900,12 @@ async function buildRepairedOlax(arrayBuffer, containerName, variant = "") {
     }
     const newFolder = oldFolder != null ? renameFolder(oldFolder) : null;
     const newStem = newFolder != null ? newFolder.replace(/\.rslt$/i, "") : null;
+    // 'freshname' mints a fully fresh identity: new <DocID>, renamed
+    // <Description>, and renamed sequence <IdentParam> names, so no
+    // existing server record for the original set can shadow the import.
+    const freshName = variant === "freshname";
+    const freshStem = freshName
+      ? (newStem || (stem != null ? stem + "-repaired" : null)) : null;
     const newKey = g.key && oldFolder && newFolder && g.key.endsWith(oldFolder)
       ? g.key.slice(0, g.key.length - oldFolder.length) + newFolder
       : g.key;
@@ -1899,12 +1920,17 @@ async function buildRepairedOlax(arrayBuffer, containerName, variant = "") {
     const acamlE = entries.find(e => /\.acaml$/i.test(e.finalName));
     let acamlBytes = variant !== "origacaml" && acamlE &&
       (withinMap.length || recs.length || variant === "freshid" ||
-        newStem != null)
+        freshName || newStem != null)
       ? repairAcamlManifest(
           await readZipFile(outer, acamlE.name),
           keepAll ? [] : withinMap, recs,
-          { freshDocId: variant === "freshid",
-            description: keepAll ? null : newStem })
+          { freshDocId: variant === "freshid" || freshName,
+            description: keepAll ? null : (freshStem || newStem),
+            identFrom: freshName && acamlE
+              ? acamlE.finalName.split("/").pop()
+                  .replace(/\.acaml$/i, "")
+              : null,
+            identTo: freshName ? freshStem : null })
       : null;
     if (acamlBytes && variant === "agifile")
       acamlBytes = agilentWriterForm(acamlBytes);

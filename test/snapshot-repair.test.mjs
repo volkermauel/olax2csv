@@ -734,6 +734,27 @@ test('variant origacaml: manifest ships byte-identically', async () => {
     app.md5Hex(inBytes), 'acaml untouched');
 });
 
+test('variant freshname: sequence identity renamed under a valid checksum', async () => {
+  // 'freshname' mints a wholly fresh identity: new <DocID>, renamed
+  // <Description>, and the sequence <IdentParam> names renamed, so a
+  // server cannot resolve the import against the original set's record.
+  const fx = buildCommitOlax();
+  reset();
+  await app.parseOlax(fx.buffer, 'commit.olax');
+  const outs = await app.buildRepairedOlax(fx.buffer, 'commit.olax', 'freshname');
+  const z = app.parseZip(await blobToU8(outs[0].blob));
+  const outAcaml = [...z.files.keys()].find(n => /\.acaml$/i.test(n));
+  const text = new TextDecoder().decode(await app.readZipFile(z, outAcaml));
+  assert.ok(!/<IdentParam>\s*<Name>Run<\/Name>/.test(text),
+    'the original sequence name is gone from IdentParam');
+  assert.match(text, /<IdentParam>\s*<Name>commit-repaired<\/Name>/,
+    'sequence identity carries the fresh name');
+  const canonical = app.acamlCanonicalDoc(text);
+  assert.equal(/<Value>([^<]*)<\/Value>/.exec(text)[1],
+    app.md5Base64(app.encodeUTF8(canonical)),
+    'checksum covers the fresh identity');
+});
+
 test('variant keepall: original fileset and names, only manifest rows added', async () => {
   // Single-variable probe against a native export: every part ships
   // byte-identically under its original name — snapshot files kept, folder
